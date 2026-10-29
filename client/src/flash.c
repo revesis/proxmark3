@@ -489,10 +489,16 @@ int flash_start_flashing(int enable_bl_writes, char *serial_port_name, uint32_t 
             }
         }
     } else {
-        PrintAndLogEx(INFO, "Available memory on this board: "_RED_("UNKNOWN")"\n");
+        PrintAndLogEx(INFO, "Available memory on this board: " _RED_("UNKNOWN")"\n");
         PrintAndLogEx(ERR, _RED_("====================== OBS ! ======================================"));
         PrintAndLogEx(ERR, _RED_("Note: Your bootloader does not understand the new" _YELLOW_(" CHIP_INFO") _RED_(" command")));
         flash_suggest_update_bootloader();
+        // Clone bootroms answer DEVICE_INFO without the CHIP_INFO flag, which used to make the
+        // flasher assume a 256K part and refuse every image above it. These units are 512K
+        // (the firmware itself reports 512K), so fall back to the full flash range.
+        flash_end = FLASH_START + AT91C_IFLASH_PAGE_SIZE * AT91C_IFLASH_NB_OF_PAGES;
+        *max_allowed = 512;
+        PrintAndLogEx(WARNING, "Assuming a 512K part: permitted range extended to 0x%08x", flash_end);
     }
 
     if (enable_bl_writes) {
