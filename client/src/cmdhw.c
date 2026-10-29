@@ -878,6 +878,138 @@ static int CmdBreak(const char *Cmd) {
 }
 
 
+// Stage markers the firmware leaves in the common area (g_common_area.arg2).
+static const char *fw_stage_name(uint32_t stage) {
+    switch (stage) {
+        case 1:  return "idle, top of main loop";
+        case 2:  return "waiting for a USB packet";
+        case 3:  return "inside a command handler";
+        case 4:  return "button-hold check";
+        case 10: return "14a reader: entered";
+        case 11: return "14a reader: field set up";
+        case 12: return "14a reader: card select done";
+        case 13: return "14a reader: select reply sent";
+        case 14: return "14a reader: turning field off";
+        case 15: return "14a reader: done";
+        case 20: return "version: entered";
+        case 21: return "version: bootrom info formatted";
+        case 22: return "version: os info formatted";
+        case 23: return "version: sending reply";
+        case 24: return "version: reply sent";
+        case 30: return "felica: entered";
+        case 31: return "felica: bitstream loaded";
+        case 32: return "felica: ssp clock synced";
+        case 33: return "felica: setup done";
+        case 34: return "felica: card select done";
+        case 35: return "felica: select reply sent";
+        default: return "unknown/stale";
+    }
+}
+
+// Bounded waits that gave up instead of spinning forever (g_diag_abort_site).
+static const char *fw_abort_site_name(uint32_t site) {
+    switch (site) {
+        case 51: return "usb_write: 1st packet TXPKTRDY";
+        case 52: return "usb_write: chunk TXCOMP set";
+        case 53: return "usb_write: chunk TXCOMP clear";
+        case 54: return "usb_write: chunk TXPKTRDY";
+        case 55: return "usb_write: end TXCOMP set";
+        case 56: return "usb_write: end TXCOMP clear";
+        case 57: return "usb_write: ZLP TXCOMP set";
+        case 58: return "usb_write: ZLP TXCOMP clear";
+        case 61: return "FPGA SPI: TXEMPTY";
+        case 62: return "FPGA SPI: RDRF";
+        case 63: return "FPGA config: DONE stayed low (wrong bitstream for this FPGA?)";
+        case 70: return "StartCountSspClk: SSC frame/clk pins";
+        case 80: return "14a tx: ssp clock (timed)";
+        case 81: return "14a tx: ssp clock";
+        case 82: return "14a tx: SSC TXRDY";
+        case 90: return "felica tx: ssp clock";
+        case 91: return "felica tx: preamble TXRDY";
+        case 92: return "felica tx: data TXRDY";
+        case 93: return "felica tx: tail TXRDY #1";
+        case 94: return "felica tx: tail TXRDY #2";
+        case 95: return "felica rx: SSC delivered nothing";
+        default: return "unknown";
+    }
+}
+
+static int CmdResetCause(const char *Cmd) {
+    CLIParserContext *ctx;
+    CLIParserInit(&ctx, "hw resetcause",
+                  "Show the AT91 reset status register (RSTC_RSR) of the last reset.\n"
+                  "RSTTYP keeps the cause until the next reset, so read it right after a reconnect.\n"
+                  "URSTS/BODSTS are cleared by the first read, which is done by the bootrom.",
+                  "hw resetcause"
+                 );
+
+    void *argtable[] = {
+        arg_param_begin,
+        arg_param_end
+    };
+    CLIExecWithReturn(ctx, Cmd, argtable, true);
+    CLIParserFree(ctx);
+
+    clearCommandBuffer();
+    PacketResponseNG resp;
+    SendCommandNG(CMD_RESET_CAUSE, NULL, 0);
+    if (WaitForResponseTimeout(CMD_RESET_CAUSE, &resp, 2000) == false) {
+        PrintAndLogEx(WARNING, "reset cause command timeout");
+        return PM3_ETIMEOUT;
+    }
+    if (resp.status != PM3_SUCCESS || resp.length < 3 * sizeof(uint32_t)) {
+        PrintAndLogEx(ERR, "reset cause command failed (status %d, length %u)", resp.status, resp.length);
+        return resp.status;
+    }
+
+    uint32_t rsr = resp.data.asDwords[0];
+    uint32_t stage = resp.data.asDwords[1];
+    uint32_t live = resp.data.asDwords[2];
+    const char *typ;
+    // RSTTYP field values, see at91sam7s512.h
+    switch (rsr & 0x700) {
+        case 0x000:
+            typ = "power-up (POR)";
+            break;
+        case 0x100:
+            typ = "wake-up";
+            break;
+        case 0x200:
+            typ = "watchdog";
+            break;
+        case 0x300:
+            typ = "software";
+            break;
+        case 0x400:
+            typ = "user (NRST pin pulled low)";
+            break;
+        case 0x500:
+            typ = "brownout (supply dipped)";
+            break;
+        default:
+            typ = "unknown";
+            break;
+    }
+
+    PrintAndLogEx(SUCCESS, "RSTC_RSR................... %08x", rsr);
+    PrintAndLogEx(SUCCESS, "  reset type............... %s", typ);
+    PrintAndLogEx(SUCCESS, "  URSTS (NRST low)......... %d", (rsr & 0x1) ? 1 : 0);
+    PrintAndLogEx(SUCCESS, "  BODSTS (brownout seen)... %d", (rsr & 0x2) ? 1 : 0);
+    PrintAndLogEx(SUCCESS, "  NRSTL (pin level)........ %d", (rsr & 0x10000) ? 1 : 0);
+
+    PrintAndLogEx(SUCCESS, "  last fw stage............ %u (%s)", stage, fw_stage_name(stage));
+    PrintAndLogEx(SUCCESS, "  current fw stage......... %u", live);
+
+    if (resp.length >= 5 * sizeof(uint32_t)) {
+        uint32_t site = resp.data.asDwords[3];
+        uint32_t count = resp.data.asDwords[4];
+        PrintAndLogEx(SUCCESS, "  bounded-wait give-ups.... %u", count);
+        if (count)
+            PrintAndLogEx(SUCCESS, "  last give-up site........ %u (%s)", site, fw_abort_site_name(site));
+    }
+    return PM3_SUCCESS;
+}
+
 static command_t CommandTable[] = {
     {"-------------", CmdHelp,         AlwaysAvailable, "----------------------- " _CYAN_("Hardware") " -----------------------"},
     {"help",          CmdHelp,         AlwaysAvailable, "This help"},
@@ -890,6 +1022,7 @@ static command_t CommandTable[] = {
     {"lcdreset",      CmdLCDReset,     IfPm3Lcd,        "Hardware reset LCD"},
     {"ping",          CmdPing,         IfPm3Present,    "Test if the Proxmark3 is responsive"},
     {"readmem",       CmdReadmem,      IfPm3Present,    "Read memory at decimal address from flash"},
+    {"resetcause",    CmdResetCause,   IfPm3Present,    "Show the AT91 reset status register (cause of the last reset)"},
     {"reset",         CmdReset,        IfPm3Present,    "Reset the Proxmark3"},
     {"setlfdivisor",  CmdSetDivisor,   IfPm3Present,    "Drive LF antenna at 12MHz / (divisor + 1)"},
     {"setmux",        CmdSetMux,       IfPm3Present,    "Set the ADC mux to a specific value"},

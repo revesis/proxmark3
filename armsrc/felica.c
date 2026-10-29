@@ -10,6 +10,7 @@
 #include "dbprint.h"
 #include "ticks.h"
 #include "iso18.h"
+#include "usb_cdc.h"   // DIAG_ABORT
 
 // FeliCa timings
 // minimum time between the start bits of consecutive transfers from reader to tag: 6800 carrier (13.56MHz) cycles
@@ -335,6 +336,34 @@ static void BuildFliteRdblk(uint8_t *idm, int blocknum, uint16_t *blocks) {
     AddCrc(frameSpace + 2, c - 2);
 }
 
+// The SSC only makes progress while the FPGA is configured and clocking it. If it is not,
+// these waits never end and the watchdog resets the board, so bound them and let the
+// command fail instead. The site that gave up is reported by `hw resetcause`.
+#define FELICA_WAIT_LIMIT 2000000
+
+static bool felica_ssp_reach(uint32_t target) {
+    uint32_t last = GetCountSspClk();
+    uint32_t stuck = 0;
+    while (GetCountSspClk() < target) {
+        uint32_t now = GetCountSspClk();
+        if (now == last) {
+            if (++stuck > FELICA_WAIT_LIMIT)
+                return false;
+        } else {
+            stuck = 0;
+            last = now;
+        }
+    }
+    return true;
+}
+
+static bool felica_txrdy(void) {
+    for (uint32_t i = 0; i < FELICA_WAIT_LIMIT; i++)
+        if (AT91C_BASE_SSC->SSC_SR & AT91C_SSC_TXRDY)
+            return true;
+    return false;
+}
+
 static void TransmitFor18092_AsReader(uint8_t *frame, int len, uint32_t *timing, uint8_t power, uint8_t highspeed) {
     uint16_t flags = FPGA_MAJOR_MODE_HF_ISO18092;
     if (power)
@@ -346,7 +375,10 @@ static void TransmitFor18092_AsReader(uint8_t *frame, int len, uint32_t *timing,
 
     uint32_t curr_transfer_time = ((MAX(felica_nexttransfertime, GetCountSspClk()) & 0xfffffff8) + 8);
 
-    while (GetCountSspClk() < curr_transfer_time) {};
+    if (!felica_ssp_reach(curr_transfer_time)) {
+        DIAG_ABORT(90);
+        return;
+    }
 
     felica_lasttime_prox2air_start = curr_transfer_time;
 
@@ -355,10 +387,12 @@ static void TransmitFor18092_AsReader(uint8_t *frame, int len, uint32_t *timing,
     uint16_t c = 0;
     while (c < 6) {
         // keep tx buffer in a defined state anyway.
-        if (AT91C_BASE_SSC->SSC_SR & (AT91C_SSC_TXRDY)) {
-            AT91C_BASE_SSC->SSC_THR = 0x00;
-            c++;
+        if (!felica_txrdy()) {
+            DIAG_ABORT(91);
+            return;
         }
+        AT91C_BASE_SSC->SSC_THR = 0x00;
+        c++;
     }
     // sending data with sync bytes
     c = 0;
@@ -369,16 +403,24 @@ static void TransmitFor18092_AsReader(uint8_t *frame, int len, uint32_t *timing,
 
     while (c < len) {
         // Put byte into tx holding register as soon as it is ready
-        if (AT91C_BASE_SSC->SSC_SR & (AT91C_SSC_TXRDY)) {
-            AT91C_BASE_SSC->SSC_THR = frame[c++];
+        if (!felica_txrdy()) {
+            DIAG_ABORT(92);
+            return;
         }
+        AT91C_BASE_SSC->SSC_THR = frame[c++];
     }
 
     /**/
-    while (!(AT91C_BASE_SSC->SSC_SR & (AT91C_SSC_TXRDY))) {};
+    if (!felica_txrdy()) {
+        DIAG_ABORT(93);
+        return;
+    }
     AT91C_BASE_SSC->SSC_THR = 0x00; //minimum delay
 
-    while (!(AT91C_BASE_SSC->SSC_SR & (AT91C_SSC_TXRDY))) {};
+    if (!felica_txrdy()) {
+        DIAG_ABORT(94);
+        return;
+    }
     AT91C_BASE_SSC->SSC_THR = 0x00; //spin
     /**/
 
@@ -411,10 +453,14 @@ bool WaitForFelicaReply(uint16_t maxbytes) {
     (void)b;
 
     uint32_t timeout = iso18092_get_timeout();
+    // The byte timeout above only advances while bytes arrive; also give up when the SSC
+    // delivers nothing at all (FPGA not clocking it), instead of spinning here forever.
+    uint32_t idle = 0;
 
     for (;;) {
         WDT_HIT();
         if (AT91C_BASE_SSC->SSC_SR & AT91C_SSC_RXRDY) {
+            idle = 0;
             b = (uint8_t)(AT91C_BASE_SSC->SSC_RHR);
             Process18092Byte(b);
             if (FelicaFrame.state == STATE_FULL) {
@@ -435,6 +481,9 @@ bool WaitForFelicaReply(uint16_t maxbytes) {
                 if (g_dbglevel >= DBG_DEBUG) Dbprintf("Error: Timeout! STATE_UNSYNCD");
                 return false;
             }
+        } else if (++idle > FELICA_WAIT_LIMIT) {
+            DIAG_ABORT(95);
+            return false;
         }
     }
 }
@@ -450,6 +499,7 @@ static void iso18092_setup(uint8_t fpga_minor_mode) {
 #else
     FpgaDownloadAndGo(FPGA_BITSTREAM_HF_FELICA);
 #endif
+    g_common_area.arg2 = 31;
     // allocate command receive buffer
     BigBuf_free();
     BigBuf_Clear_ext(false);
@@ -480,6 +530,7 @@ static void iso18092_setup(uint8_t fpga_minor_mode) {
 
     // Start the timer
     StartCountSspClk();
+    g_common_area.arg2 = 32;
 
     LED_D_ON();
 }
@@ -507,19 +558,25 @@ void felica_sendraw(PacketCommandNG *c) {
 
     felica_card_select_t card;
 
+    // Stage markers for post-mortem analysis of a watchdog reset (see hw resetcause).
+    g_common_area.arg2 = 30;
+
     if ((param & FELICA_CONNECT))
         if (g_dbglevel >= DBG_DEBUG) Dbprintf("Clear trace");
     clear_trace();
 
     set_tracing(true);
     iso18092_setup(FPGA_HF_ISO18092_FLAG_READER | FPGA_HF_ISO18092_FLAG_NOMOD);
+    g_common_area.arg2 = 33;
 
     if ((param & FELICA_CONNECT)) {
         // notify client selecting status.
         // if failed selecting, turn off antenna and quite.
         if (!(param & FELICA_NO_SELECT)) {
             arg0 = felica_select_card(&card);
+            g_common_area.arg2 = 34;
             reply_mix(CMD_ACK, arg0, sizeof(card.uid), 0, &card, sizeof(felica_card_select_t));
+            g_common_area.arg2 = 35;
             if (arg0 > 0) {
                 if (g_dbglevel >= DBG_DEBUG) Dbprintf("Error: Failed selecting card! ");
                 felica_reset_frame_mode();

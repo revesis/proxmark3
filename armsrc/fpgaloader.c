@@ -18,6 +18,7 @@
 #include "dbprint.h"
 #include "util.h"
 #include "fpga.h"
+#include "usb_cdc.h"   // DIAG_ABORT
 #include "string.h"
 
 #include "lz4.h"       // uncompress
@@ -359,10 +360,16 @@ static void DownloadFPGA(int bitstream_version, int FpgaImageLen, lz4_streamp_t 
         HIGH(GPIO_FPGA_CCLK);
         LOW(GPIO_FPGA_CCLK);
     }
-    // crude error indicator, leave both red LEDs on and return
-    if (i == 0) {
+    // crude error indicator, leave both red LEDs on and return.
+    // Check the pin itself: the loop above exits with i == -1 on timeout, so testing i
+    // never caught a failed configuration. A bitstream for the wrong FPGA (e.g. an XC2S30
+    // image on a clone fitted with an XC3S100E or XC2S50) ends up here, and everything that
+    // depends on the FPGA (field, SSC clock, antenna ADC) then silently stops working.
+    if ((AT91C_BASE_PIOA->PIO_PDSR & GPIO_FPGA_DONE) == 0) {
+        DIAG_ABORT(63);
         LED_C_ON();
         LED_D_ON();
+        Dbprintf("FPGA did not configure (DONE low) - bitstream does not match the fitted FPGA?");
         return;
     }
     LED_D_OFF();
@@ -521,11 +528,31 @@ void FpgaDownloadAndGo(int bitstream_version) {
 //
 // @params cmd and v  gets OR:ED over each other.  Take careful note of overlapping bits.
 //-----------------------------------------------------------------------------
+#define FPGA_SPI_WAIT_LIMIT 2000000
+
+// The FPGA stops answering SPI when it loses its (volatile) configuration — typical when
+// the rail dips during HF field bursts on clone boards. An unbounded wait here ends in a
+// watchdog reset or a wedged firmware, so bound it and invalidate the bitstream: the next
+// command reloads the FPGA instead of talking to a dead one.
+static bool fpga_spi_wait(uint32_t mask, bool level) {
+    for (uint32_t i = 0; i < FPGA_SPI_WAIT_LIMIT; i++)
+        if (((AT91C_BASE_SPI->SPI_SR & mask) != 0) == level)
+            return true;
+    return false;
+}
+
 void FpgaSendCommand(uint16_t cmd, uint16_t v) {
     SetupSpi(SPI_FPGA_MODE);
-    while ((AT91C_BASE_SPI->SPI_SR & AT91C_SPI_TXEMPTY) == 0); // wait for the transfer to complete
+    if (!fpga_spi_wait(AT91C_SPI_TXEMPTY, true)) {  // wait for the transfer to complete
+        DIAG_ABORT(61);
+        downloaded_bitstream = 0;
+        return;
+    }
     AT91C_BASE_SPI->SPI_TDR = AT91C_SPI_LASTXFER | cmd | v;    // send the data
-    while (!(AT91C_BASE_SPI->SPI_SR & AT91C_SPI_RDRF)) {};     // wait till transfer is complete
+    if (!fpga_spi_wait(AT91C_SPI_RDRF, true)) {     // wait till transfer is complete
+        DIAG_ABORT(62);
+        downloaded_bitstream = 0;
+    }
 }
 //-----------------------------------------------------------------------------
 // Write the FPGA setup word (that determines what mode the logic is in, read

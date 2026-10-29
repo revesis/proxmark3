@@ -135,4 +135,7 @@ typedef struct {
     int arg1, arg2;
 } PACKED common_area_t;
 
+// Shared between the bootrom and the app; also carries a post-mortem stage marker.
+extern common_area_t g_common_area;
+
 #endif

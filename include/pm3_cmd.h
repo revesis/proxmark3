@@ -456,6 +456,7 @@ typedef struct {
 #define CMD_TIA                                                           0x0117
 #define CMD_BREAK_LOOP                                                    0x0118
 #define CMD_SET_TEAROFF                                                   0x0119
+#define CMD_RESET_CAUSE                                                   0x011a
 
 // RDV40, Flash memory operations
 #define CMD_FLASHMEM_WRITE                                                0x0121

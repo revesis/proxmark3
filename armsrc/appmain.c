@@ -72,6 +72,8 @@ uint8_t g_trigger = 0;
 bool g_hf_field_active = false;
 extern uint32_t _stack_start[], _stack_end[];
 common_area_t g_common_area __attribute__((section(".commonarea")));
+// Stage the firmware had reached when the previous run died (see CMD_RESET_CAUSE).
+static uint32_t g_prev_stage = 0;
 static int button_status = BUTTON_NO_CLICK;
 static bool allow_send_wtx = false;
 uint16_t g_tearoff_delay_us = 0;
@@ -263,6 +265,8 @@ static void SendVersion(void) {
      * pointer, then use it.
      */
     // dummy casting to avoid "dereferencing type-punned pointer breaking strict-aliasing rules" errors
+    // Stage markers for post-mortem analysis of a watchdog reset (see hw resetcause).
+    g_common_area.arg2 = 20;
     uint32_t bootrom_version_ptr = (uint32_t)_bootphase1_version_pointer;
     char *bootrom_version = *(char **)(bootrom_version_ptr);
 
@@ -275,10 +279,12 @@ static void SendVersion(void) {
         strncat(VersionString, temp, sizeof(VersionString) - strlen(VersionString) - 1);
         strncat(VersionString, "\n", sizeof(VersionString) - strlen(VersionString) - 1);
     }
+    g_common_area.arg2 = 21;
 
     FormatVersionInformation(temp, sizeof(temp), "       os: ", &g_version_information);
     strncat(VersionString, temp, sizeof(VersionString) - strlen(VersionString) - 1);
     strncat(VersionString, "\n", sizeof(VersionString) - strlen(VersionString) - 1);
+    g_common_area.arg2 = 22;
 
 #if defined(__clang__)
     strncat(VersionString, "  compiled with Clang/LLVM "__VERSION__"\n", sizeof(VersionString) - strlen(VersionString) - 1);
@@ -317,7 +323,9 @@ static void SendVersion(void) {
     payload.versionstr_len = strlen(VersionString) + 1;
     memcpy(payload.versionstr, VersionString, payload.versionstr_len);
 
+    g_common_area.arg2 = 23;
     reply_ng(CMD_VERSION, PM3_SUCCESS, (uint8_t *)&payload, 12 + payload.versionstr_len);
+    g_common_area.arg2 = 24;
 }
 
 static void TimingIntervalAcquisition(void) {
@@ -2351,6 +2359,20 @@ static void PacketReceived(PacketCommandNG *packet) {
             SendStatus();
             break;
         }
+        case CMD_RESET_CAUSE: {
+            // RSTTYP holds the cause of the last reset until the next one; URSTS/BODSTS clear on read.
+            // arg2 is the firmware stage marker kept in the common area (retained across a
+            // watchdog reset by the bootrom), i.e. where the code was when it fired.
+            // info[3]/[4]: last bounded wait that gave up instead of hanging, and how often.
+            uint32_t info[5];
+            info[0] = AT91C_BASE_RSTC->RSTC_RSR;
+            info[1] = g_prev_stage;
+            info[2] = (uint32_t)g_common_area.arg2;
+            info[3] = g_diag_abort_site;
+            info[4] = g_diag_abort_count;
+            reply_ng(CMD_RESET_CAUSE, PM3_SUCCESS, (uint8_t *)info, sizeof(info));
+            break;
+        }
         case CMD_TIA: {
 
             while ((AT91C_BASE_PMC->PMC_MCFR & AT91C_CKGR_MAINRDY) == 0);       // Wait for MAINF value to become available...
@@ -2427,6 +2449,11 @@ static void PacketReceived(PacketCommandNG *packet) {
 
 void  __attribute__((noreturn)) AppMain(void) {
 
+    // Post-mortem of the previous run: the bootrom keeps the common area across a
+    // watchdog reset, so arg2 still holds the stage the firmware reached before the
+    // watchdog fired. Snapshot it before the main loop starts overwriting it.
+    g_prev_stage = (uint32_t)g_common_area.arg2;
+
     SpinDelay(100);
     BigBuf_initialize();
 
@@ -2490,6 +2517,9 @@ void  __attribute__((noreturn)) AppMain(void) {
 
     for (;;) {
         WDT_HIT();
+        // Post-mortem stage marker: the bootrom keeps the common area across a watchdog
+        // reset, so `hw resetcause` can report where the firmware was when it fired.
+        g_common_area.arg2 = 1;
 
         if (*_stack_start != 0xdeadbeef) {
             Dbprintf("Stack overflow detected! Please increase stack size, currently %d bytes", (uint32_t)_stack_end - (uint32_t)_stack_start);
@@ -2501,8 +2531,10 @@ void  __attribute__((noreturn)) AppMain(void) {
         PacketCommandNG rx;
         memset(&rx.data, 0, sizeof(rx.data));
 
+        g_common_area.arg2 = 2;
         int ret = receive_ng(&rx);
         if (ret == PM3_SUCCESS) {
+            g_common_area.arg2 = 3;
             PacketReceived(&rx);
         } else if (ret != PM3_ENODATA) {
 
@@ -2511,6 +2543,7 @@ void  __attribute__((noreturn)) AppMain(void) {
         }
 
         // Press button for one second to enter a possible standalone mode
+        g_common_area.arg2 = 4;
         button_status = BUTTON_HELD(1000);
         if (button_status == BUTTON_HOLD) {
             /*

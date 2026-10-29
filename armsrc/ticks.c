@@ -12,6 +12,7 @@
 
 #include "proxmark3_arm.h"
 #include "dbprint.h"
+#include "usb_cdc.h"   // DIAG_ABORT
 
 
 // timer counts in 666ns increments (32/48MHz), rounding applies
@@ -141,6 +142,18 @@ uint32_t RAMFUNC GetCountUS(void) {
 //  -------------------------------------------------------------------------
 //  Timer for iso14443 commands. Uses ssp_clk from FPGA
 //  -------------------------------------------------------------------------
+#define SSP_WAIT_LIMIT 2000000
+
+// Wait for an FPGA-driven SSC pin to reach a level. The FPGA stops driving these pins when
+// it lost its configuration, so bound the wait: the caller then fails the command instead
+// of tripping the watchdog.
+static bool ssp_wait_pin(uint32_t mask, bool level) {
+    for (uint32_t i = 0; i < SSP_WAIT_LIMIT; i++)
+        if (((AT91C_BASE_PIOA->PIO_PDSR & mask) != 0) == level)
+            return true;
+    return false;
+}
+
 void StartCountSspClk(void) {
     AT91C_BASE_PMC->PMC_PCER |= (1 << AT91C_ID_TC0) | (1 << AT91C_ID_TC1) | (1 << AT91C_ID_TC2);  // Enable Clock to all timers
     AT91C_BASE_TCB->TCB_BMR = AT91C_TCB_TC0XC0S_TIOA1       // XC0 Clock = TIOA1
@@ -184,20 +197,20 @@ void StartCountSspClk(void) {
     // synchronize the counter with the ssp_frame signal.
     // Note: FPGA must be in a FPGA mode with SSC transfer, otherwise SSC_FRAME and SSC_CLK signals would not be present
     //
-    while (AT91C_BASE_PIOA->PIO_PDSR & GPIO_SSC_FRAME);     // wait for ssp_frame to be low
-    while (!(AT91C_BASE_PIOA->PIO_PDSR & GPIO_SSC_FRAME));  // wait for ssp_frame to go high (start of frame)
-    while (!(AT91C_BASE_PIOA->PIO_PDSR & GPIO_SSC_CLK));    // wait for ssp_clk to go high; 1st ssp_clk after start of frame
-    while (AT91C_BASE_PIOA->PIO_PDSR & GPIO_SSC_CLK);       // wait for ssp_clk to go low;
-    while (!(AT91C_BASE_PIOA->PIO_PDSR & GPIO_SSC_CLK));    // wait for ssp_clk to go high; 2nd ssp_clk after start of frame
-    if ((AT91C_BASE_SSC->SSC_RFMR & SSC_FRAME_MODE_BITS_IN_WORD(32)) == SSC_FRAME_MODE_BITS_IN_WORD(16)) { // 16bit frame
-        while (AT91C_BASE_PIOA->PIO_PDSR & GPIO_SSC_CLK);   // wait for ssp_clk to go low;
-        while (!(AT91C_BASE_PIOA->PIO_PDSR & GPIO_SSC_CLK)); // wait for ssp_clk to go high; 3rd ssp_clk after start of frame
-        while (AT91C_BASE_PIOA->PIO_PDSR & GPIO_SSC_CLK);   // wait for ssp_clk to go low;
-        while (!(AT91C_BASE_PIOA->PIO_PDSR & GPIO_SSC_CLK)); // wait for ssp_clk to go high; 4th ssp_clk after start of frame
-        while (AT91C_BASE_PIOA->PIO_PDSR & GPIO_SSC_CLK);   // wait for ssp_clk to go low;
-        while (!(AT91C_BASE_PIOA->PIO_PDSR & GPIO_SSC_CLK)); // wait for ssp_clk to go high; 5th ssp_clk after start of frame
-        while (AT91C_BASE_PIOA->PIO_PDSR & GPIO_SSC_CLK);   // wait for ssp_clk to go low;
-        while (!(AT91C_BASE_PIOA->PIO_PDSR & GPIO_SSC_CLK)); // wait for ssp_clk to go high; 6th ssp_clk after start of frame
+    bool ok = ssp_wait_pin(GPIO_SSC_FRAME, false)               // wait for ssp_frame to be low
+              && ssp_wait_pin(GPIO_SSC_FRAME, true)             // wait for ssp_frame to go high (start of frame)
+              && ssp_wait_pin(GPIO_SSC_CLK, true)               // 1st ssp_clk after start of frame
+              && ssp_wait_pin(GPIO_SSC_CLK, false)
+              && ssp_wait_pin(GPIO_SSC_CLK, true);              // 2nd ssp_clk after start of frame
+    if (ok && (AT91C_BASE_SSC->SSC_RFMR & SSC_FRAME_MODE_BITS_IN_WORD(32)) == SSC_FRAME_MODE_BITS_IN_WORD(16)) { // 16bit frame
+        ok = ssp_wait_pin(GPIO_SSC_CLK, false) && ssp_wait_pin(GPIO_SSC_CLK, true)      // 3rd
+             && ssp_wait_pin(GPIO_SSC_CLK, false) && ssp_wait_pin(GPIO_SSC_CLK, true)   // 4th
+             && ssp_wait_pin(GPIO_SSC_CLK, false) && ssp_wait_pin(GPIO_SSC_CLK, true)   // 5th
+             && ssp_wait_pin(GPIO_SSC_CLK, false) && ssp_wait_pin(GPIO_SSC_CLK, true);  // 6th
+    }
+    if (!ok) {
+        DIAG_ABORT(70);
+        return;
     }
 
     // note: up to now two ssp_clk rising edges have passed since the rising edge of ssp_frame

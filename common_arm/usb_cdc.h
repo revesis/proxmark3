@@ -57,4 +57,10 @@ void AT91F_USB_SendZlp(AT91PS_UDP pudp);
 void AT91F_USB_SendStall(AT91PS_UDP pudp);
 void AT91F_CDC_Enumerate(void);
 
+// Diagnostics: site code of the most recent bounded wait that gave up instead of spinning
+// forever (0 = none yet), and how many times any of them gave up. Reported by `hw resetcause`.
+extern volatile uint32_t g_diag_abort_site;
+extern volatile uint32_t g_diag_abort_count;
+#define DIAG_ABORT(site) do { g_diag_abort_site = (site); g_diag_abort_count++; } while (0)
+
 #endif // _USB_CDC_H_

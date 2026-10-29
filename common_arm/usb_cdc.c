@@ -723,6 +723,35 @@ uint32_t usb_read_ng(uint8_t *data, size_t len) {
  * \brief Send through endpoint 2 (device to host)
  *----------------------------------------------------------------------------
 */
+/*
+ * A host that stops fetching the IN endpoint (slow USB/IP tunnel, client gone) leaves
+ * TXPKTRDY set forever. Spinning without bound trips the watchdog on boards whose
+ * bootrom enables it, and wedges the firmware on boards where it is off. Bound the wait,
+ * keep feeding the watchdog, and report an I/O error so the caller can carry on.
+ */
+#define USB_IN_WAIT_LIMIT 4000000
+
+static bool usb_in_wait(uint32_t mask, bool level) {
+    for (uint32_t i = 0; i < USB_IN_WAIT_LIMIT; i++) {
+        if (((pUdp->UDP_CSR[AT91C_EP_IN] & mask) != 0) == level)
+            return true;
+        if ((i & 0x3fff) == 0)
+            WDT_HIT();
+    }
+    return false;
+}
+
+volatile uint32_t g_diag_abort_site = 0;
+volatile uint32_t g_diag_abort_count = 0;
+
+// site: which wait in usb_write gave up (51..58, in source order), see `hw resetcause`
+static int usb_in_abort(uint32_t site) {
+    DIAG_ABORT(site);
+    UDP_CLEAR_EP_FLAGS(AT91C_EP_IN, AT91C_UDP_TXPKTRDY);
+    UDP_CLEAR_EP_FLAGS(AT91C_EP_IN, AT91C_UDP_TXCOMP);
+    return PM3_EIO;
+}
+
 int usb_write(const uint8_t *data, const size_t len) {
 
     if (!len) return PM3_EINVARG;
@@ -743,7 +772,7 @@ int usb_write(const uint8_t *data, const size_t len) {
     }
 
     UDP_SET_EP_FLAGS(AT91C_EP_IN, AT91C_UDP_TXPKTRDY);
-    while (pUdp->UDP_CSR[AT91C_EP_IN] & AT91C_UDP_TXPKTRDY) {};
+    if (!usb_in_wait(AT91C_UDP_TXPKTRDY, false)) return usb_in_abort(51);
 
     while (length) {
         // Send next chunk
@@ -755,33 +784,31 @@ int usb_write(const uint8_t *data, const size_t len) {
 
         // Wait for previous chunk to be sent
         // (iceman) when is the bankswapping done?
-        while (!(pUdp->UDP_CSR[AT91C_EP_IN] & AT91C_UDP_TXCOMP)) {
-            if (!usb_check()) return PM3_EIO;
-        }
+        if (!usb_in_wait(AT91C_UDP_TXCOMP, true)) return usb_in_abort(52);
+        if (!usb_check()) return PM3_EIO;
 
         UDP_CLEAR_EP_FLAGS(AT91C_EP_IN, AT91C_UDP_TXCOMP);
-        while (pUdp->UDP_CSR[AT91C_EP_IN] & AT91C_UDP_TXCOMP) {};
+        if (!usb_in_wait(AT91C_UDP_TXCOMP, false)) return usb_in_abort(53);
 
         UDP_SET_EP_FLAGS(AT91C_EP_IN, AT91C_UDP_TXPKTRDY);
-        while (pUdp->UDP_CSR[AT91C_EP_IN] & AT91C_UDP_TXPKTRDY) {};
+        if (!usb_in_wait(AT91C_UDP_TXPKTRDY, false)) return usb_in_abort(54);
     }
 
     // Wait for the end of transfer
-    while (!(pUdp->UDP_CSR[AT91C_EP_IN] & AT91C_UDP_TXCOMP)) {
-        if (!usb_check()) return PM3_EIO;
-    }
+    if (!usb_in_wait(AT91C_UDP_TXCOMP, true)) return usb_in_abort(55);
+    if (!usb_check()) return PM3_EIO;
 
     UDP_CLEAR_EP_FLAGS(AT91C_EP_IN, AT91C_UDP_TXCOMP);
-    while (pUdp->UDP_CSR[AT91C_EP_IN] & AT91C_UDP_TXCOMP) {};
+    if (!usb_in_wait(AT91C_UDP_TXCOMP, false)) return usb_in_abort(56);
 
 
     if (len % AT91C_EP_IN_SIZE == 0) {
 
         UDP_SET_EP_FLAGS(AT91C_EP_IN, AT91C_UDP_TXPKTRDY);
-        while (!(pUdp->UDP_CSR[AT91C_EP_IN] & AT91C_UDP_TXCOMP)) {};
+        if (!usb_in_wait(AT91C_UDP_TXCOMP, true)) return usb_in_abort(57);
 
         UDP_CLEAR_EP_FLAGS(AT91C_EP_IN, AT91C_UDP_TXCOMP);
-        while (pUdp->UDP_CSR[AT91C_EP_IN] & AT91C_UDP_TXCOMP) {};
+        if (!usb_in_wait(AT91C_UDP_TXCOMP, false)) return usb_in_abort(58);
     }
 
     return PM3_SUCCESS;

@@ -21,6 +21,7 @@
 #include "dbprint.h"
 #include "util.h"
 #include "util.h"
+#include "usb_cdc.h"   // DIAG_ABORT
 #include "parity.h"
 #include "mifareutil.h"
 #include "commonutil.h"
@@ -1823,6 +1824,34 @@ static void PrepareDelayedTransfer(uint16_t delay) {
 // if == 0:    transfer immediately and return time of transfer
 // if != 0: delay transfer until time specified
 //-------------------------------------------------------------------------------------
+// The SSC only makes progress while the FPGA is configured. If it lost its configuration
+// (marginal rail during HF field bursts on clone boards) these waits never end, which ends
+// in a watchdog reset or a wedged firmware. Bound them so the command just fails.
+#define SSC_WAIT_LIMIT 2000000
+
+static bool SscWaitTxReady(void) {
+    for (uint32_t i = 0; i < SSC_WAIT_LIMIT; i++)
+        if (AT91C_BASE_SSC->SSC_SR & AT91C_SSC_TXRDY)
+            return true;
+    return false;
+}
+
+static bool SspClkReach(uint32_t target) {
+    uint32_t last = GetCountSspClk();
+    uint32_t stuck = 0;
+    while (GetCountSspClk() < target) {
+        uint32_t now = GetCountSspClk();
+        if (now == last) {
+            if (++stuck > SSC_WAIT_LIMIT)
+                return false;
+        } else {
+            stuck = 0;
+            last = now;
+        }
+    }
+    return true;
+}
+
 static void TransmitFor14443a(const uint8_t *cmd, uint16_t len, uint32_t *timing) {
 
     if (g_hf_field_active == false) {
@@ -1839,24 +1868,32 @@ static void TransmitFor14443a(const uint8_t *cmd, uint16_t len, uint32_t *timing
 
         if (g_dbglevel >= DBG_EXTENDED && GetCountSspClk() >= (*timing & 0xfffffff8))
             Dbprintf("TransmitFor14443a: Missed timing");
-        while (GetCountSspClk() < (*timing & 0xfffffff8)) {};    // Delay transfer (multiple of 8 MF clock ticks)
+        if (!SspClkReach(*timing & 0xfffffff8)) {                // Delay transfer (multiple of 8 MF clock ticks)
+            DIAG_ABORT(80);
+            return;
+        }
         LastTimeProxToAirStart = *timing;
     } else {
 
         uint32_t ThisTransferTime = 0;
         ThisTransferTime = ((MAX(NextTransferTime, GetCountSspClk()) & 0xfffffff8) + 8);
 
-        while (GetCountSspClk() < ThisTransferTime) {};
+        if (!SspClkReach(ThisTransferTime)) {
+            DIAG_ABORT(81);
+            return;
+        }
 
         LastTimeProxToAirStart = ThisTransferTime;
     }
 
     uint16_t c = 0;
     while (c < len) {
-        if (AT91C_BASE_SSC->SSC_SR & (AT91C_SSC_TXRDY)) {
-            AT91C_BASE_SSC->SSC_THR = cmd[c];
-            c++;
+        if (!SscWaitTxReady()) {
+            DIAG_ABORT(82);
+            return;
         }
+        AT91C_BASE_SSC->SSC_THR = cmd[c];
+        c++;
     }
 
     NextTransferTime = MAX(NextTransferTime, LastTimeProxToAirStart + REQUEST_GUARD_TIME);
@@ -2890,6 +2927,9 @@ void ReaderIso14443a(PacketCommandNG *c) {
     uint8_t buf[PM3_CMD_DATA_SIZE] = {0x00};
     uint8_t par[MAX_PARITY_SIZE] = {0x00};
 
+    // Stage markers for post-mortem analysis of a watchdog reset (see hw resetcause).
+    g_common_area.arg2 = 10;
+
     if ((param & ISO14A_CONNECT)) {
         iso14_pcb_blocknum = 0;
         clear_trace();
@@ -2902,6 +2942,7 @@ void ReaderIso14443a(PacketCommandNG *c) {
 
     if ((param & ISO14A_CONNECT)) {
         iso14443a_setup(FPGA_HF_ISO14443A_READER_LISTEN);
+        g_common_area.arg2 = 11;
 
         // notify client selecting status.
         // if failed selecting, turn off antenna and quite.
@@ -2909,8 +2950,10 @@ void ReaderIso14443a(PacketCommandNG *c) {
             iso14a_card_select_t *card = (iso14a_card_select_t *)buf;
             arg0 = iso14443a_select_cardEx(NULL, card, NULL, true, 0, (param & ISO14A_NO_RATS), (param & ISO14A_USE_ECP), (param & ISO14A_USE_MAGSAFE));
             FpgaDisableTracing();
+            g_common_area.arg2 = 12;
 
             reply_mix(CMD_ACK, arg0, card->uidlen, 0, buf, sizeof(iso14a_card_select_t));
+            g_common_area.arg2 = 13;
             if (arg0 == 0)
                 goto OUT;
         }
@@ -2991,8 +3034,10 @@ void ReaderIso14443a(PacketCommandNG *c) {
         return;
 
 OUT:
+    g_common_area.arg2 = 14;
     hf_field_off();
     set_tracing(false);
+    g_common_area.arg2 = 15;
 }
 
 // Determine the distance between two nonces.
