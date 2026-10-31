@@ -12,7 +12,9 @@
 
 #define FPGA_BITSTREAM_FIXED_HEADER_SIZE    sizeof(bitparse_fixed_header)
 #define FPGA_INTERLEAVE_SIZE                288
-#if defined XC3
+#if defined XC3S50A
+#define FPGA_CONFIG_SIZE                    55008L  // XC3S50A .bit files are 54735 bytes. Rounded up to next multiple of FPGA_INTERLEAVE_SIZE
+#elif defined XC3
 #define FPGA_CONFIG_SIZE                    72864L  // our current fpga_[lh]f.bit files are 72742 bytes. Rounded up to next multiple of FPGA_INTERLEAVE_SIZE
 #else
 #define FPGA_CONFIG_SIZE                    42336L  // our current fpga_[lh]f.bit files are 42175 bytes. Rounded up to next multiple of FPGA_INTERLEAVE_SIZE

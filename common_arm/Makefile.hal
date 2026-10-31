@@ -86,6 +86,10 @@ else ifeq ($(PLATFORM),PM3OTHER)
 else ifeq ($(PLATFORM),PM3GENERIC)
     PLTNAME = Proxmark3 generic target
     PLATFORM_FPGA = xc2s30
+else ifeq ($(PLATFORM),PM3XC3S50A)
+    PLATFORM_DEFS = -DXC3S50A
+    PLTNAME = Proxmark3 RDV4 clone with XC3S50A
+    PLATFORM_FPGA = xc3s50a
 else ifeq ($(PLATFORM),PM3ICOPYX)
     PLATFORM_DEFS = -DWITH_FLASH -DICOPYX -DXC3
     PLTNAME = iCopy-X with XC3S100E

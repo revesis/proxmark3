@@ -1,0 +1,48 @@
+# Pin constraints for the Suzhou Longda "RDV2 mod" board with an XC3S50A-VQ100,
+# worked out with the probe bitstreams in fpga3a/probe (see PM3-交通卡-排查记录.md).
+
+NET "adc_d<7>" LOC = "P33" | IOSTANDARD = LVCMOS33 ;
+NET "adc_d<6>" LOC = "P32" | IOSTANDARD = LVCMOS33 ;
+NET "adc_d<5>" LOC = "P6" | IOSTANDARD = LVCMOS33 ;
+NET "adc_d<4>" LOC = "P5" | IOSTANDARD = LVCMOS33 ;
+NET "adc_d<3>" LOC = "P4" | IOSTANDARD = LVCMOS33 ;
+NET "adc_d<2>" LOC = "P3" | IOSTANDARD = LVCMOS33 ;
+NET "adc_d<1>" LOC = "P56" | IOSTANDARD = LVCMOS33 ;
+NET "adc_d<0>" LOC = "P57" | IOSTANDARD = LVCMOS33 ;
+NET "adc_clk" LOC = "P64" | IOSTANDARD = LVCMOS33 ;
+NET "adc_noe" LOC = "P65" | IOSTANDARD = LVCMOS33 ;
+NET "ck_1356meg" LOC = "P89" | IOSTANDARD = LVCMOS33 ;
+NET "ck_1356megb" LOC = "P90" | IOSTANDARD = LVCMOS33 ;
+NET "pck0" LOC = "P44" | IOSTANDARD = LVCMOS33 ;
+NET "spck" LOC = "P59" | IOSTANDARD = LVCMOS33 ;
+NET "miso" LOC = "P60" | IOSTANDARD = LVCMOS33 ;
+NET "mosi" LOC = "P61" | IOSTANDARD = LVCMOS33 ;
+NET "ncs" LOC = "P62" | IOSTANDARD = LVCMOS33 ;
+NET "ssp_frame" LOC = "P40" | IOSTANDARD = LVCMOS33 ;
+NET "ssp_din" LOC = "P41" | IOSTANDARD = LVCMOS33 ;
+NET "ssp_dout" LOC = "P43" | IOSTANDARD = LVCMOS33 ;
+NET "ssp_clk" LOC = "P83" | IOSTANDARD = LVCMOS33 ;
+NET "pwr_hi" LOC = "P70" | IOSTANDARD = LVCMOS33 ;
+NET "pwr_lo" LOC = "P71" | IOSTANDARD = LVCMOS33 ;
+NET "pwr_oe1" LOC = "P72" | IOSTANDARD = LVCMOS33 ;
+NET "pwr_oe2" LOC = "P73" | IOSTANDARD = LVCMOS33 ;
+NET "pwr_oe3" LOC = "P85" | IOSTANDARD = LVCMOS33 ;
+NET "pwr_oe4" LOC = "P84" | IOSTANDARD = LVCMOS33 ;
+NET "cross_hi" LOC = "P9" | IOSTANDARD = LVCMOS33 ;
+NET "cross_lo" LOC = "P10" | IOSTANDARD = LVCMOS33 ;
+NET "dbg" LOC = "P48" | IOSTANDARD = LVCMOS33 ;
+
+NET "ck_1356meg" TNM_NET = "clk_net_1356" ;
+NET "ck_1356megb" TNM_NET = "clk_net_1356b" ;
+NET "pck0" TNM_NET = "clk_net_pck0" ;
+NET "spck" TNM_NET = "clk_net_spck" ;
+TIMEGRP "clk_net_1356_all" = "clk_net_1356" "clk_net_1356b" ;
+TIMESPEC "TS_1356MHz" = PERIOD "clk_net_1356_all" 74 ns HIGH 37 ns ;
+TIMESPEC "TS_24MHz" = PERIOD "clk_net_pck0" 42 ns HIGH 21 ns ;
+TIMESPEC "TS_4MHz" = PERIOD "clk_net_spck" 250 ns HIGH 125 ns ;
+NET "ck_1356meg" CLOCK_DEDICATED_ROUTE = FALSE ;
+NET "ck_1356megb" CLOCK_DEDICATED_ROUTE = FALSE ;
+NET "pck0" CLOCK_DEDICATED_ROUTE = FALSE ;
+NET "spck" CLOCK_DEDICATED_ROUTE = FALSE ;
+NET "ssp_dout" CLOCK_DEDICATED_ROUTE = FALSE ;
+NET "adc_d<*>" CLOCK_DEDICATED_ROUTE = FALSE ;
