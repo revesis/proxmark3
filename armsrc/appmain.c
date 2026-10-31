@@ -384,6 +384,292 @@ static void printConnSpeed(void) {
     Dbprintf("  Transfer Speed PM3 -> Client... " _YELLOW_("%d") " bytes/s", 1000 * bytes_transferred / delta_time);
 }
 
+// Hardware probe for boards with an unknown FPGA wiring: drive one PIOA pin for hold_us, release
+// it, then sample all of PIOA for win_us and report which inputs reacted (e.g. NINIT dropping
+// while the real NPROGRAM pin is low, or a config clock toggling on its own).
+static void PioProbe(const pio_probe_req_t *req) {
+    static pio_probe_resp_t r;
+    memset(&r, 0, sizeof(r));
+    AT91PS_PIO pio = AT91C_BASE_PIOA;
+    uint32_t bit = 1u << (req->pin & 31);
+
+    StartCountUS();
+    r.psr = pio->PIO_PSR;
+    r.osr = pio->PIO_OSR;
+    r.odsr = pio->PIO_ODSR;
+    r.pusr = pio->PIO_PPUSR;
+    r.init_high_us = 0xffffffff;
+
+    // never touch the USB pull-up, the host would drop us
+    bool drive = req->drive && bit != GPIO_USB_PU;
+
+    uint32_t prev = pio->PIO_PDSR;
+    r.before = prev;
+    if (drive) {
+        if (req->level)
+            pio->PIO_SODR = bit;
+        else
+            pio->PIO_CODR = bit;
+        pio->PIO_OER = bit;
+        pio->PIO_PER = bit;
+        uint32_t t0 = GetCountUS();
+        while (GetCountUS() - t0 < req->hold_us) {
+            uint32_t now = pio->PIO_PDSR;
+            r.tog_during |= now ^ prev;
+            prev = now;
+            WDT_HIT();
+        }
+        r.during = prev;
+
+        // back to how it was
+        if (r.odsr & bit) pio->PIO_SODR = bit; else pio->PIO_CODR = bit;
+        if ((r.osr & bit) == 0) pio->PIO_ODR = bit;
+        if ((r.psr & bit) == 0) pio->PIO_PDR = bit;
+    }
+
+    uint32_t t0 = GetCountUS();
+    prev = pio->PIO_PDSR;
+    r.after_first = prev;
+    uint32_t el;
+    while ((el = GetCountUS() - t0) < req->win_us) {
+        uint32_t now = pio->PIO_PDSR;
+        uint32_t ch = now ^ prev;
+        if (ch) {
+            r.tog_after |= ch;
+            for (int i = 0; i < 32; i++)
+                if (ch & (1u << i)) r.edges_after[i]++;
+        }
+        if (r.init_high_us == 0xffffffff && (now & GPIO_FPGA_NINIT))
+            r.init_high_us = el;
+        prev = now;
+        r.samples++;
+        if ((r.samples & 0xfff) == 0) WDT_HIT();
+    }
+    r.after_last = prev;
+    reply_ng(CMD_PIO_PROBE, PM3_SUCCESS, (uint8_t *)&r, sizeof(r));
+}
+
+// Analog look at the pins: AD0..AD3 share PA17..PA20 (PA17/PA18 go straight to FPGA I/O).
+// Each of those is read as a plain input with the internal pull-up on and off; a pin held near
+// a diode drop with the pull-up on is being clamped into an unpowered rail. AD4..AD7 as they are.
+static void PioAdc(void) {
+    uint16_t v[3][8];
+    memset(v, 0, sizeof(v));
+    AT91PS_PIO pio = AT91C_BASE_PIOA;
+    uint32_t psr = pio->PIO_PSR, osr = pio->PIO_OSR, pusr = pio->PIO_PPUSR;
+
+    for (int ch = 0; ch < 8; ch++)
+        v[0][ch] = AvgAdc(ch);
+
+    for (int ch = 0; ch < 4; ch++) {
+        uint32_t bit = AT91C_PIO_PA17 << ch;
+        pio->PIO_ODR = bit;
+        pio->PIO_PER = bit;
+        pio->PIO_PPUER = bit;
+        SpinDelay(5);
+        v[1][ch] = AvgAdc(ch);
+        pio->PIO_PPUDR = bit;
+        SpinDelay(5);
+        v[2][ch] = AvgAdc(ch);
+
+        if (pusr & bit) pio->PIO_PPUDR = bit; else pio->PIO_PPUER = bit;
+        if (osr & bit) pio->PIO_OER = bit;
+        if ((psr & bit) == 0) pio->PIO_PDR = bit;
+        WDT_HIT();
+    }
+    AT91C_BASE_ADC->ADC_CR = AT91C_ADC_SWRST;
+    reply_ng(CMD_PIO_ADC, PM3_SUCCESS, (uint8_t *)v, sizeof(v));
+}
+
+// Slave serial load of a bitstream streamed in chunks, with the config pins given by the
+// client, for boards whose FPGA type and wiring are still being worked out.
+static void FpgaRawLoad(const fpga_rawload_req_t *req) {
+    static uint32_t prog, cclk, din, done, bytes;
+    static fpga_rawload_resp_t r;
+    AT91PS_PIO pio = AT91C_BASE_PIOA;
+
+    if (req->phase == FPGA_RAWLOAD_START) {
+        memset(&r, 0, sizeof(r));
+        prog = 1u << (req->pin_prog & 31);
+        cclk = 1u << (req->pin_cclk & 31);
+        din = 1u << (req->pin_din & 31);
+        done = 1u << (req->pin_done & 31);
+        // never touch the USB pull-up
+        uint32_t outs = (prog | cclk | din) & ~GPIO_USB_PU;
+        bytes = 0;
+
+        pio->PIO_ODR = done | GPIO_FPGA_NINIT;
+        pio->PIO_PER = done | GPIO_FPGA_NINIT;
+        pio->PIO_PPUER = done | GPIO_FPGA_NINIT;
+        pio->PIO_SODR = prog;
+        pio->PIO_CODR = cclk | din;
+        pio->PIO_OER = outs;
+        pio->PIO_PER = outs;
+        SpinDelay(5);
+        r.pdsr_idle = pio->PIO_PDSR;
+        pio->PIO_CODR = prog;
+        SpinDelay(50);
+        r.pdsr_prog = pio->PIO_PDSR;
+        pio->PIO_SODR = prog;
+        // INIT_B may not reach the ARM, so just give the FPGA time to clear its memory
+        SpinDelay(50);
+        r.pdsr_after = pio->PIO_PDSR;
+    } else if (req->phase == FPGA_RAWLOAD_DATA) {
+        uint16_t len = MIN(req->len, FPGA_RAWLOAD_CHUNK);
+        for (uint16_t i = 0; i < len; i++) {
+            uint8_t w = req->data[i];
+            for (int b = 7; b >= 0; b--) {
+                if (w & (1 << b)) pio->PIO_SODR = din; else pio->PIO_CODR = din;
+                pio->PIO_SODR = cclk;
+                pio->PIO_CODR = cclk;
+            }
+        }
+        bytes += len;
+    } else {
+        r.done_clocks = 0xffffffff;
+        for (uint32_t i = 0; i < 100000; i++) {
+            if (pio->PIO_PDSR & done) {
+                r.done_clocks = i;
+                break;
+            }
+            pio->PIO_SODR = cclk;
+            pio->PIO_CODR = cclk;
+            if ((i & 0xfff) == 0) WDT_HIT();
+        }
+        // a few more clocks so the startup sequence can finish
+        for (int i = 0; i < 64; i++) {
+            pio->PIO_SODR = cclk;
+            pio->PIO_CODR = cclk;
+        }
+        r.pdsr_after = pio->PIO_PDSR;
+    }
+    r.bytes = bytes;
+    reply_ng(CMD_FPGA_RAWLOAD, PM3_SUCCESS, (uint8_t *)&r, sizeof(r));
+}
+
+// Read frames from the wiring probe bitstream: DIN becomes an input, CCLK clocks the FPGA,
+// DIN is sampled after each rising edge. Optionally holds one other PIOA pin meanwhile.
+static void FpgaProbeRead(const fpga_probe_req_t *req) {
+    static uint8_t bits[FPGA_PROBE_MAXBYTES];
+    AT91PS_PIO pio = AT91C_BASE_PIOA;
+    uint32_t cclk = GPIO_FPGA_CCLK, din = GPIO_FPGA_DIN;
+    uint16_t nbits = MIN(req->nbits, FPGA_PROBE_MAXBYTES * 8);
+    memset(bits, 0, sizeof(bits));
+
+    pio->PIO_ODR = din;
+    pio->PIO_PER = din;
+    pio->PIO_PPUDR = din;
+    pio->PIO_CODR = cclk;
+    pio->PIO_OER = cclk;
+    pio->PIO_PER = cclk;
+
+    uint32_t bit = 1u << (req->pin & 31);
+    // leave alone: USB pull-up, PROG (would wipe the FPGA), and the probe channel itself
+    bool drive = req->drive && ((bit & (GPIO_USB_PU | GPIO_FPGA_NPROGRAM | cclk | din)) == 0);
+    uint32_t psr = pio->PIO_PSR, osr = pio->PIO_OSR, odsr = pio->PIO_ODSR;
+    if (drive) {
+        if (req->level) pio->PIO_SODR = bit; else pio->PIO_CODR = bit;
+        pio->PIO_OER = bit;
+        pio->PIO_PER = bit;
+    }
+    SpinDelay(2);
+
+    for (uint16_t i = 0; i < req->arm_clocks; i++) {
+        pio->PIO_SODR = cclk;
+        pio->PIO_CODR = cclk;
+    }
+    for (uint16_t i = 0; i < nbits; i++) {
+        pio->PIO_SODR = cclk;
+        pio->PIO_CODR = cclk;
+        if (pio->PIO_PDSR & din) bits[i >> 3] |= 0x80 >> (i & 7);
+    }
+
+    if (drive) {
+        if (odsr & bit) pio->PIO_SODR = bit; else pio->PIO_CODR = bit;
+        if ((osr & bit) == 0) pio->PIO_ODR = bit;
+        if ((psr & bit) == 0) pio->PIO_PDR = bit;
+    }
+    reply_ng(CMD_FPGA_PROBE_READ, PM3_SUCCESS, bits, (nbits + 7) / 8);
+}
+
+// TX test: in ISO14443A READER_MOD, mod_sig_coil follows ssp_dout directly, so holding
+// ssp_dout high must pull the HF field off if the modulation path works. Measure the ARM's
+// own HF peak-detector ADC in three states and report them.
+static uint16_t hf_field_mv(void) {
+    return (MAX_ADC_HF_VOLTAGE * SumAdc(ADC_CHAN_HF, 32)) >> 15;
+}
+
+static void HfTxTest(void) {
+    FpgaDownloadAndGo(FPGA_BITSTREAM_HF);
+
+    // Isolate the ADC-mux effect: measure field (ARM peak-detector) in 4 combinations.
+    FpgaWriteConfWord(FPGA_MAJOR_MODE_HF_READER);
+    SpinDelay(50);
+    uint16_t rd_nomux = hf_field_mv();
+    SetAdcMuxFor(GPIO_MUXSEL_HIPKD);
+    SpinDelay(30);
+    uint16_t rd_mux = hf_field_mv();
+
+    SetAdcMuxFor(GPIO_MUXSEL_HIRAW);
+    SpinDelay(30);
+    uint16_t rd_hiraw = hf_field_mv();
+
+    FpgaWriteConfWord(FPGA_MAJOR_MODE_HF_ISO14443A | FPGA_HF_ISO14443A_READER_LISTEN);
+    SetAdcMuxFor(GPIO_MUXSEL_HIPKD);
+    SpinDelay(30);
+    uint16_t v_listen = hf_field_mv();
+
+    // take ssp_dout (PA17) under PIO control and drive it by hand
+    AT91C_BASE_PIOA->PIO_PER = GPIO_SSC_DOUT;
+    AT91C_BASE_PIOA->PIO_OER = GPIO_SSC_DOUT;
+
+    AT91C_BASE_PIOA->PIO_CODR = GPIO_SSC_DOUT;                 // ssp_dout = 0 -> carrier on
+    FpgaWriteConfWord(FPGA_MAJOR_MODE_HF_ISO14443A | FPGA_HF_ISO14443A_READER_MOD);
+    SpinDelay(30);
+    uint16_t v_mod_lo = hf_field_mv();
+
+    AT91C_BASE_PIOA->PIO_SODR = GPIO_SSC_DOUT;                 // ssp_dout = 1 -> carrier should pause
+    SpinDelay(30);
+    uint16_t v_mod_hi = hf_field_mv();
+
+    // give the pin back to the SSC and stop the field
+    AT91C_BASE_PIOA->PIO_PDR = GPIO_SSC_DOUT;
+    FpgaWriteConfWord(FPGA_MAJOR_MODE_OFF);
+
+    uint16_t out[6] = { rd_nomux, rd_mux, rd_hiraw, v_listen, v_mod_lo, v_mod_hi };
+    reply_ng(CMD_HF_ADC_DUMP, PM3_SUCCESS, (uint8_t *)out, sizeof(out));
+}
+
+// Dump raw SSC amplitude words from the FPGA HF reader path, to check the external ADC chain.
+static void HfAdcDump(const hf_adc_dump_req_t *req) {
+    if (req->mode == 3) { HfTxTest(); return; }
+    if (req->mode == 4 || req->mode == 5) {
+        uint8_t fbuf[HF_14A_RXDUMP_BYTES];
+        memset(fbuf, 0, sizeof(fbuf));
+        Felica18092RxDump(fbuf, sizeof(fbuf), req->mode == 4);
+        reply_ng(CMD_HF_ADC_DUMP, PM3_SUCCESS, fbuf, sizeof(fbuf));
+        return;
+    }
+    uint16_t nwords = req->nwords;
+    if (nwords == 0 || nwords > HF_ADC_DUMP_WORDS) nwords = HF_ADC_DUMP_WORDS;
+    uint16_t buf[HF_ADC_DUMP_WORDS];
+    memset(buf, 0, sizeof(buf));
+
+    FpgaDownloadAndGo(FPGA_BITSTREAM_HF);
+    SetAdcMuxFor(GPIO_MUXSEL_HIPKD);
+    FpgaWriteConfWord(FPGA_MAJOR_MODE_HF_READER | FPGA_HF_READER_SUBCARRIER_848_KHZ | (req->mode & 0x0f));
+    SpinDelay(20);
+    FpgaSetupSsc(FPGA_MAJOR_MODE_HF_READER);
+
+    for (uint16_t i = 0; i < nwords; i++) {
+        while ((AT91C_BASE_SSC->SSC_SR & AT91C_SSC_RXRDY) == 0) { WDT_HIT(); }
+        buf[i] = (uint16_t)AT91C_BASE_SSC->SSC_RHR;
+    }
+
+    FpgaWriteConfWord(FPGA_MAJOR_MODE_OFF);
+    reply_ng(CMD_HF_ADC_DUMP, PM3_SUCCESS, (uint8_t *)buf, nwords * 2);
+}
+
 /**
   * Prints runtime information about the PM3.
 **/
@@ -2371,6 +2657,30 @@ static void PacketReceived(PacketCommandNG *packet) {
             info[3] = g_diag_abort_site;
             info[4] = g_diag_abort_count;
             reply_ng(CMD_RESET_CAUSE, PM3_SUCCESS, (uint8_t *)info, sizeof(info));
+            break;
+        }
+        case CMD_PIO_PROBE: {
+            PioProbe((const pio_probe_req_t *)packet->data.asBytes);
+            break;
+        }
+        case CMD_PIO_ADC: {
+            PioAdc();
+            break;
+        }
+        case CMD_FPGA_RAWLOAD: {
+            FpgaRawLoad((const fpga_rawload_req_t *)packet->data.asBytes);
+            break;
+        }
+        case CMD_FPGA_PROBE_READ: {
+            FpgaProbeRead((const fpga_probe_req_t *)packet->data.asBytes);
+            break;
+        }
+        case CMD_HF_ADC_DUMP: {
+            HfAdcDump((const hf_adc_dump_req_t *)packet->data.asBytes);
+            break;
+        }
+        case CMD_HF_14A_RXDUMP: {
+            Hf14aRxDump();
             break;
         }
         case CMD_TIA: {

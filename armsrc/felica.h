@@ -15,6 +15,7 @@
 #include "cmd.h"
 
 void felica_sendraw(PacketCommandNG *c);
+void Felica18092RxDump(uint8_t *out, uint16_t n, bool raw);
 void felica_sniff(uint32_t samplesToSkip, uint32_t triggersToSkip);
 void felica_sim_lite(uint8_t *uid);
 void felica_dump_lite_s(void);

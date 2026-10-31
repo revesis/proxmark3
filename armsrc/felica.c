@@ -440,6 +440,24 @@ static void TransmitFor18092_AsReader(uint8_t *frame, int len, uint32_t *timing,
 // Wait for tag reply
 // stop when button is pressed
 // or return TRUE when command is captured
+// DIAGNOSTIC: send a FeliCa POLL and capture the raw hi_flite demod byte stream, to check
+// whether the card's reply produces any modulation activity at the current thresholds.
+void Felica18092RxDump(uint8_t *out, uint16_t n, bool raw) {
+    static uint8_t poll[10] = {0xb2, 0x4d, 0x06, FELICA_POLL_REQ, 0xFF, 0xFF, 0x00, 0x00, 0x09, 0x21};
+    iso18092_setup(FPGA_HF_ISO18092_FLAG_READER | FPGA_HF_ISO18092_FLAG_NOMOD);
+    TransmitFor18092_AsReader(poll, sizeof(poll), NULL, 1, 0);
+    // power on, no modulation; raw=stream raw adc_d bytes, else the hi_flite demod bits
+    uint16_t extra = raw ? FPGA_HF_ISO18092_FLAG_RAWADC : 0;
+    FpgaWriteConfWord(FPGA_MAJOR_MODE_HF_ISO18092 | FPGA_HF_ISO18092_FLAG_READER | FPGA_HF_ISO18092_FLAG_NOMOD | extra);
+    uint8_t b = (uint8_t)AT91C_BASE_SSC->SSC_RHR;
+    (void)b;
+    for (uint16_t i = 0; i < n; i++) {
+        while ((AT91C_BASE_SSC->SSC_SR & AT91C_SSC_RXRDY) == 0) { WDT_HIT(); }
+        out[i] = (uint8_t)AT91C_BASE_SSC->SSC_RHR;
+    }
+    FpgaWriteConfWord(FPGA_MAJOR_MODE_OFF);
+}
+
 bool WaitForFelicaReply(uint16_t maxbytes) {
     if (g_dbglevel >= DBG_DEBUG)
         Dbprintf("WaitForFelicaReply Start");

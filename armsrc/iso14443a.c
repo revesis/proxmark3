@@ -2779,6 +2779,28 @@ int iso14443a_fast_select_card(uint8_t *uid_ptr, uint8_t num_cascades) {
     return 1;
 }
 
+// DIAGNOSTIC: send a WUPA and capture the raw FPGA demod byte stream (what ManchesterDecoding
+// sees). Lets us check whether the card's reply shows up as modulation activity at all.
+void Hf14aRxDump(void) {
+    uint8_t buf[HF_14A_RXDUMP_BYTES];
+    uint8_t wupa[1] = { ISO14443A_CMD_WUPA };
+
+    iso14443a_setup(FPGA_HF_ISO14443A_READER_MOD);
+    ReaderTransmitBitsPar(wupa, 7, NULL, NULL);
+
+    FpgaWriteConfWord(FPGA_MAJOR_MODE_HF_ISO14443A | FPGA_HF_ISO14443A_READER_LISTEN);
+    uint8_t b = (uint8_t)AT91C_BASE_SSC->SSC_RHR;
+    (void)b;
+    for (uint16_t i = 0; i < sizeof(buf); i++) {
+        while ((AT91C_BASE_SSC->SSC_SR & AT91C_SSC_RXRDY) == 0) { WDT_HIT(); }
+        buf[i] = (uint8_t)AT91C_BASE_SSC->SSC_RHR;
+    }
+
+    FpgaWriteConfWord(FPGA_MAJOR_MODE_OFF);
+    g_hf_field_active = false;
+    reply_ng(CMD_HF_14A_RXDUMP, PM3_SUCCESS, buf, sizeof(buf));
+}
+
 void iso14443a_setup(uint8_t fpga_minor_mode) {
 
     FpgaDownloadAndGo(FPGA_BITSTREAM_HF);

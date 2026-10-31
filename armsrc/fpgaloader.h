@@ -116,6 +116,7 @@ thres|                          x x x x x x x x
 #define FPGA_HF_ISO18092_FLAG_NOMOD                 0x1 // 0001 disable modulation module
 #define FPGA_HF_ISO18092_FLAG_424K                  0x2 // 0010 should enable 414k mode (untested). No autodetect
 #define FPGA_HF_ISO18092_FLAG_READER                0x4 // 0100 enables antenna power, to act as a reader instead of tag
+#define FPGA_HF_ISO18092_FLAG_RAWADC                0x8 // 1000 DIAGNOSTIC: stream raw adc_d bytes instead of demod bits
 
 void FpgaSendCommand(uint16_t cmd, uint16_t v);
 void FpgaWriteConfWord(uint16_t v);

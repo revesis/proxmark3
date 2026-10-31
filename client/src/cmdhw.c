@@ -934,6 +934,500 @@ static const char *fw_abort_site_name(uint32_t site) {
     }
 }
 
+static const char *pio_name(int i) {
+    static const char *n[32] = {
+        "LED_A", "PA1", "LED_D", "NVDD_ON", "FPGA_NINIT", "PA5", "PCK0", "LRST",
+        "LED_B", "LED_C", "NCS2", "NCS0", "MISO", "MOSI", "SPCK", "SSC_FRAME",
+        "SSC_CLK", "SSC_DOUT", "SSC_DIN", "MUX_HIPKD", "MUX_LOPKD", "MUX_HIRAW", "MUX_LORAW", "BUTTON",
+        "USB_PU", "RELAY", "FPGA_ON", "FPGA_DONE", "FPGA_NPROG", "FPGA_CCLK", "FPGA_DIN", "FPGA_DOUT"
+    };
+    return n[i & 31];
+}
+
+static void pio_print_bits(const char *label, uint32_t mask) {
+    char buf[400] = {0};
+    for (int i = 0; i < 32; i++) {
+        if (mask & (1u << i)) {
+            char t[24];
+            snprintf(t, sizeof(t), " PA%d(%s)", i, pio_name(i));
+            strncat(buf, t, sizeof(buf) - strlen(buf) - 1);
+        }
+    }
+    PrintAndLogEx(SUCCESS, "  %-16s%s", label, mask ? buf : " -");
+}
+
+static int pio_probe_once(uint8_t pin, uint8_t level, bool drive, uint32_t hold, uint32_t win, pio_probe_resp_t *out) {
+    pio_probe_req_t req = { .pin = pin, .level = level, .drive = drive, .hold_us = hold, .win_us = win };
+    PacketResponseNG resp;
+    clearCommandBuffer();
+    SendCommandNG(CMD_PIO_PROBE, (uint8_t *)&req, sizeof(req));
+    if (WaitForResponseTimeout(CMD_PIO_PROBE, &resp, 2000 + (hold + win) / 1000) == false) {
+        PrintAndLogEx(WARNING, "pio probe timeout");
+        return PM3_ETIMEOUT;
+    }
+    if (resp.status != PM3_SUCCESS || resp.length < sizeof(pio_probe_resp_t)) {
+        PrintAndLogEx(ERR, "pio probe failed (status %d, length %u)", resp.status, resp.length);
+        return PM3_ESOFT;
+    }
+    memcpy(out, resp.data.asBytes, sizeof(*out));
+    return PM3_SUCCESS;
+}
+
+static int CmdPioProbe(const char *Cmd) {
+    CLIParserContext *ctx;
+    CLIParserInit(&ctx, "hw pioprobe",
+                  "Hardware probe: drive one PIOA pin, then watch all PIOA inputs.\n"
+                  "Without -p it only watches. --scan pulses every pin (except USB_PU) and\n"
+                  "reports which other inputs follow, e.g. which pin really drives FPGA NPROGRAM.",
+                  "hw pioprobe --win 200000          -> just watch for 200ms\n"
+                  "hw pioprobe -p 28 -l 0            -> pulse NPROGRAM low, watch NINIT/DONE\n"
+                  "hw pioprobe --scan -l 0"
+                 );
+    void *argtable[] = {
+        arg_param_begin,
+        arg_int0("p", "pin", "<0-31>", "PAx to drive"),
+        arg_int0("l", "level", "<0|1>", "level while driven (def 0)"),
+        arg_u64_0(NULL, "hold", "<us>", "drive time (def 1000)"),
+        arg_u64_0(NULL, "win", "<us>", "watch time after release (def 20000)"),
+        arg_lit0(NULL, "scan", "pulse every pin in turn"),
+        arg_param_end
+    };
+    CLIExecWithReturn(ctx, Cmd, argtable, true);
+    int pin = arg_get_int_def(ctx, 1, -1);
+    uint8_t level = arg_get_int_def(ctx, 2, 0) ? 1 : 0;
+    uint32_t hold = arg_get_u32_def(ctx, 3, 1000);
+    uint32_t win = arg_get_u32_def(ctx, 4, 20000);
+    bool scan = arg_get_lit(ctx, 5);
+    CLIParserFree(ctx);
+
+    pio_probe_resp_t r;
+    if (scan) {
+        if (pio_probe_once(0, 0, false, 0, win, &r) != PM3_SUCCESS) return PM3_ETIMEOUT;
+        // PCK0 is a clock we output ourselves, it always looks like it moved
+        uint32_t noisy = r.tog_after | (r.before ^ r.after_last) | (1u << 6);
+        PrintAndLogEx(INFO, "PDSR idle %08x, toggling on its own:", r.before);
+        pio_print_bits("free running", noisy);
+        for (int i = 0; i < 32; i++) {
+            if (i == 24) continue; // USB_PU
+            if (pio_probe_once(i, level, true, hold, win, &r) != PM3_SUCCESS) return PM3_ETIMEOUT;
+            uint32_t self = 1u << i;
+            // what other inputs moved while/after we drove PAi, ignoring free running ones
+            uint32_t react = ((r.before ^ r.during) | r.tog_during | (r.during ^ r.after_first) | r.tog_after) & ~self & ~noisy;
+            if (react == 0) continue;
+            PrintAndLogEx(SUCCESS, "PA%-2d (%s) %s -> before %08x during %08x after %08x/%08x  NINIT high after %d us",
+                          i, pio_name(i), level ? "high" : "low", r.before, r.during, r.after_first, r.after_last,
+                          r.init_high_us == 0xffffffff ? -1 : (int)r.init_high_us);
+            pio_print_bits("reacted", react);
+        }
+        PrintAndLogEx(INFO, "scan done");
+        return PM3_SUCCESS;
+    }
+
+    if (pio_probe_once(pin < 0 ? 0 : pin, level, pin >= 0, hold, win, &r) != PM3_SUCCESS)
+        return PM3_ETIMEOUT;
+    PrintAndLogEx(SUCCESS, "PSR %08x OSR %08x ODSR %08x PUSR %08x", r.psr, r.osr, r.odsr, r.pusr);
+    PrintAndLogEx(SUCCESS, "PDSR before %08x  during %08x  after %08x  end %08x  (%u samples)",
+                  r.before, r.during, r.after_first, r.after_last, r.samples);
+    pio_print_bits("low before", ~r.before);
+    if (pin >= 0) {
+        pio_print_bits("changed driving", (r.before ^ r.during) | r.tog_during);
+        pio_print_bits("changed release", r.during ^ r.after_first);
+    }
+    pio_print_bits("toggled in win", r.tog_after);
+    for (int i = 0; i < 32; i++)
+        if (r.edges_after[i])
+            PrintAndLogEx(SUCCESS, "    PA%-2d %-10s %u edges", i, pio_name(i), r.edges_after[i]);
+    if (r.init_high_us == 0xffffffff)
+        PrintAndLogEx(SUCCESS, "  NINIT never high in window");
+    else
+        PrintAndLogEx(SUCCESS, "  NINIT high after %u us", r.init_high_us);
+    return PM3_SUCCESS;
+}
+
+static int CmdPioAdc(const char *Cmd) {
+    CLIParserContext *ctx;
+    CLIParserInit(&ctx, "hw pioadc",
+                  "Read the ARM ADC on all channels. AD0..AD3 (PA17..PA20) are also read as plain\n"
+                  "inputs with the internal pull-up on/off: a pin that stays near a diode drop with\n"
+                  "the pull-up on is clamped into an unpowered rail (e.g. an FPGA without supply).",
+                  "hw pioadc"
+                 );
+    void *argtable[] = {
+        arg_param_begin,
+        arg_param_end
+    };
+    CLIExecWithReturn(ctx, Cmd, argtable, true);
+    CLIParserFree(ctx);
+
+    PacketResponseNG resp;
+    clearCommandBuffer();
+    SendCommandNG(CMD_PIO_ADC, NULL, 0);
+    if (WaitForResponseTimeout(CMD_PIO_ADC, &resp, 3000) == false) {
+        PrintAndLogEx(WARNING, "pio adc timeout");
+        return PM3_ETIMEOUT;
+    }
+    if (resp.status != PM3_SUCCESS || resp.length < 3 * 8 * sizeof(uint16_t)) {
+        PrintAndLogEx(ERR, "pio adc failed (status %d, length %u)", resp.status, resp.length);
+        return PM3_ESOFT;
+    }
+    uint16_t v[3][8];
+    memcpy(v, resp.data.asBytes, sizeof(v));
+    static const char *what[8] = {
+        "PA17 SSC_DOUT (to FPGA)", "PA18 SSC_DIN (from FPGA)", "PA19 MUX_HIPKD", "PA20 MUX_LOPKD",
+        "AD4", "AD5", "AD6", "AD7"
+    };
+    // 10 bit, ADVREF = 3.3V
+    PrintAndLogEx(INFO, "ch  pin                        as-is    pull-up   floating");
+    for (int ch = 0; ch < 8; ch++) {
+        if (ch < 4)
+            PrintAndLogEx(SUCCESS, "AD%d %-26s %4u mV  %4u mV  %4u mV", ch, what[ch],
+                          v[0][ch] * 3300 / 1023, v[1][ch] * 3300 / 1023, v[2][ch] * 3300 / 1023);
+        else
+            PrintAndLogEx(SUCCESS, "AD%d %-26s %4u mV", ch, what[ch], v[0][ch] * 3300 / 1023);
+    }
+    return PM3_SUCCESS;
+}
+
+static int CmdHfAdcDump(const char *Cmd) {
+    CLIParserContext *ctx;
+    CLIParserInit(&ctx, "hw hfadcdump",
+                  "Put the FPGA in HF reader mode (field ON, 848kHz subcarrier) and dump the raw\n"
+                  "16-bit SSC amplitude words coming from the external ADC. Use to check the\n"
+                  "external-ADC -> FPGA -> SSC receive path. Place a card on the antenna.",
+                  "hw hfadcdump\n"
+                  "hw hfadcdump --mode 0   -> RECEIVE_IQ\n"
+                  "hw hfadcdump --mode 1   -> RECEIVE_AMPLITUDE"
+                 );
+    void *argtable[] = {
+        arg_param_begin,
+        arg_int0(NULL, "mode", "<n>", "FPGA reader receive mode low-nibble (0=IQ, 1=AMPLITUDE, default 1)"),
+        arg_param_end
+    };
+    CLIExecWithReturn(ctx, Cmd, argtable, true);
+    int mode = arg_get_int_def(ctx, 1, 1);
+    CLIParserFree(ctx);
+
+    hf_adc_dump_req_t req = { .mode = (uint8_t)mode, .pad = 0, .nwords = HF_ADC_DUMP_WORDS };
+    PacketResponseNG resp;
+    clearCommandBuffer();
+    SendCommandNG(CMD_HF_ADC_DUMP, (uint8_t *)&req, sizeof(req));
+    if (WaitForResponseTimeout(CMD_HF_ADC_DUMP, &resp, 3000) == false) {
+        PrintAndLogEx(WARNING, "hf adc dump timeout");
+        return PM3_ETIMEOUT;
+    }
+    if (resp.status != PM3_SUCCESS || resp.length < 2) {
+        PrintAndLogEx(ERR, "hf adc dump failed (status %d, length %u)", resp.status, resp.length);
+        return PM3_ESOFT;
+    }
+    if (mode == 5) {
+        uint16_t nn = resp.length;
+        uint8_t *dd = resp.data.asBytes;
+        uint16_t nz = 0, first = 0xffff;
+        for (uint16_t i = 0; i < nn; i++)
+            if (dd[i] != 0x00) { nz++; if (first == 0xffff) first = i; }
+        PrintAndLogEx(INFO, "FeliCa demod bits: bytes %u  non-zero %u  first nz @%d",
+                      nn, nz, (first == 0xffff) ? -1 : (int)first);
+        if (nz == 0)
+            PrintAndLogEx(WARNING, _RED_("  all zero -> curbit never set (decode/sync not triggering)"));
+        char l5[160]; int q = 0;
+        for (uint16_t i = 0; i < nn; i++) {
+            q += snprintf(l5 + q, sizeof(l5) - q, "%02X", dd[i]);
+            if ((i & 31) == 31) { PrintAndLogEx(INFO, "D %04d %s", i - 31, l5); q = 0; }
+        }
+        if (q) PrintAndLogEx(INFO, "D %s", l5);
+        return PM3_SUCCESS;
+    }
+    if (mode == 4) {
+        // each byte = one raw adc_d sample (37.7us apart); find the modulation swing
+        uint16_t nn = resp.length;
+        uint8_t *dd = resp.data.asBytes;
+        uint8_t mn = 255, mx = 0; uint32_t sum = 0;
+        for (uint16_t i = 0; i < nn; i++) {
+            if (dd[i] < mn) mn = dd[i];
+            if (dd[i] > mx) mx = dd[i];
+            sum += dd[i];
+        }
+        unsigned mean = nn ? sum / nn : 0;
+        PrintAndLogEx(INFO, "FeliCa raw ADC: samples %u  min %u  max %u  mean %u  swing %u",
+                      nn, mn, mx, mean, mx - mn);
+        // count samples far from mean (modulation activity)
+        uint16_t lo = 0, hi = 0;
+        for (uint16_t i = 0; i < nn; i++) {
+            if (dd[i] + 20 < mean) lo++;
+            if (dd[i] > mean + 20) hi++;
+        }
+        PrintAndLogEx(INFO, "  samples >20 below mean: %u   >20 above: %u", lo, hi);
+        char l2[200]; int q = 0;
+        for (uint16_t i = 0; i < nn; i++) {
+            q += snprintf(l2 + q, sizeof(l2) - q, "%02X", dd[i]);
+            if ((i & 31) == 31) { PrintAndLogEx(INFO, "R %04d %s", i - 31, l2); q = 0; }
+        }
+        if (q) PrintAndLogEx(INFO, "R %s", l2);
+        return PM3_SUCCESS;
+    }
+    if (mode == 3) {
+        if (resp.length < 12) { PrintAndLogEx(ERR, "tx test short resp"); return PM3_ESOFT; }
+        uint16_t *v = (uint16_t *)resp.data.asBytes;
+        PrintAndLogEx(INFO, "Field vs ADC-mux (ARM HF peak-detector):");
+        PrintAndLogEx(SUCCESS, "  HF_READER, no mux set ........ %u mV", v[0]);
+        PrintAndLogEx(SUCCESS, "  HF_READER, mux HIPKD ......... %u mV", v[1]);
+        PrintAndLogEx(SUCCESS, "  HF_READER, mux HIRAW ......... %u mV", v[2]);
+        PrintAndLogEx(INFO, "TX modulation test (ISO14443A):");
+        PrintAndLogEx(SUCCESS, "  READER_LISTEN (carrier on) ... %u mV", v[3]);
+        PrintAndLogEx(SUCCESS, "  READER_MOD ssp_dout=0 (on) ... %u mV", v[4]);
+        PrintAndLogEx(SUCCESS, "  READER_MOD ssp_dout=1 (pause). %u mV", v[5]);
+        if (v[5] < v[4] / 2)
+            PrintAndLogEx(SUCCESS, _GREEN_("  => field pauses: TX modulation path WORKS"));
+        else
+            PrintAndLogEx(WARNING, _RED_("  => field does NOT pause: TX modulation path BROKEN"));
+        return PM3_SUCCESS;
+    }
+    uint16_t n = resp.length / 2;
+    uint16_t *w = (uint16_t *)resp.data.asBytes;
+
+    // mode 2: each word is {window_max(hi), window_min(lo)}; otherwise two raw bytes
+    uint16_t gmin = 0xffff, gmax = 0, maxspan = 0;
+    uint32_t spansum = 0;
+    for (uint16_t i = 0; i < n; i++) {
+        uint8_t hi = (uint8_t)(w[i] >> 8), lo = (uint8_t)(w[i] & 0xff);
+        uint8_t span = (hi >= lo) ? (hi - lo) : (lo - hi);
+        spansum += span;
+        if (span > maxspan) maxspan = span;
+        if (lo < gmin) gmin = lo;
+        if (hi > gmax) gmax = hi;
+    }
+    PrintAndLogEx(INFO, "words %u   overall min %u  max %u   per-window span avg %u  max %u",
+                  n, gmin, gmax, n ? (unsigned)(spansum / n) : 0, maxspan);
+    PrintAndLogEx(INFO, "(mode 2: large per-window span => raw carrier at ADC; ~0 => DC envelope)");
+    PrintAndLogEx(INFO, "first 32 words (hex):");
+    char line[128]; int p = 0;
+    for (uint16_t i = 0; i < n && i < 32; i++) {
+        p += snprintf(line + p, sizeof(line) - p, "%04X ", w[i]);
+        if ((i & 7) == 7) { PrintAndLogEx(INFO, "  %s", line); p = 0; }
+    }
+    if (p) PrintAndLogEx(INFO, "  %s", line);
+    return PM3_SUCCESS;
+}
+
+static int CmdHf14aRxDump(const char *Cmd) {
+    CLIParserContext *ctx;
+    CLIParserInit(&ctx, "hw rxdump14a",
+                  "Send a WUPA and dump the raw FPGA demodulator byte stream, to see whether the\n"
+                  "card's reply appears as modulation activity. Place an ISO14443A card on the antenna.",
+                  "hw rxdump14a");
+    void *argtable[] = { arg_param_begin, arg_param_end };
+    CLIExecWithReturn(ctx, Cmd, argtable, true);
+    CLIParserFree(ctx);
+
+    PacketResponseNG resp;
+    clearCommandBuffer();
+    SendCommandNG(CMD_HF_14A_RXDUMP, NULL, 0);
+    if (WaitForResponseTimeout(CMD_HF_14A_RXDUMP, &resp, 3000) == false) {
+        PrintAndLogEx(WARNING, "rxdump timeout");
+        return PM3_ETIMEOUT;
+    }
+    uint16_t n = resp.length;
+    uint8_t *d = resp.data.asBytes;
+    uint16_t nz = 0, first = 0xffff, last = 0;
+    for (uint16_t i = 0; i < n; i++) {
+        if (d[i] != 0x00) { nz++; if (first == 0xffff) first = i; last = i; }
+    }
+    PrintAndLogEx(INFO, "bytes %u   non-zero %u   first nz @%d  last nz @%d", n, nz,
+                  (first == 0xffff) ? -1 : (int)first, (int)last);
+    if (nz == 0)
+        PrintAndLogEx(WARNING, _RED_("  all zero -> demod saw no modulation (no reply detected)"));
+    else
+        PrintAndLogEx(SUCCESS, _GREEN_("  modulation present -> card replied; decode/timing is the issue"));
+    // print the window around first activity
+    uint16_t start = (first == 0xffff) ? 0 : (first > 8 ? first - 8 : 0);
+    char line[128]; int p = 0;
+    for (uint16_t i = start; i < n && i < start + 64; i++) {
+        p += snprintf(line + p, sizeof(line) - p, "%02X", d[i]);
+        if (((i - start) & 15) == 15) { PrintAndLogEx(INFO, "  %04d: %s", start + ((i - start) & ~15), line); p = 0; }
+        else p += snprintf(line + p, sizeof(line) - p, " ");
+    }
+    if (p) PrintAndLogEx(INFO, "  %s", line);
+    return PM3_SUCCESS;
+}
+
+static int fpga_rawload_send(fpga_rawload_req_t *req, size_t len, fpga_rawload_resp_t *out, uint32_t timeout) {
+    PacketResponseNG resp;
+    clearCommandBuffer();
+    SendCommandNG(CMD_FPGA_RAWLOAD, (uint8_t *)req, len);
+    if (WaitForResponseTimeout(CMD_FPGA_RAWLOAD, &resp, timeout) == false) {
+        PrintAndLogEx(WARNING, "fpga rawload timeout (phase %u)", req->phase);
+        return PM3_ETIMEOUT;
+    }
+    if (resp.status != PM3_SUCCESS || resp.length < sizeof(fpga_rawload_resp_t)) {
+        PrintAndLogEx(ERR, "fpga rawload failed (status %d, length %u)", resp.status, resp.length);
+        return PM3_ESOFT;
+    }
+    memcpy(out, resp.data.asBytes, sizeof(*out));
+    return PM3_SUCCESS;
+}
+
+// .bit: fixed 13 byte preamble, then sections a..d (16 bit length) and e (32 bit length) = config data
+static const uint8_t *bit_find_data(const uint8_t *d, size_t n, size_t *len) {
+    static const uint8_t pre[13] = {0x00, 0x09, 0x0f, 0xf0, 0x0f, 0xf0, 0x0f, 0xf0, 0x0f, 0xf0, 0x00, 0x00, 0x01};
+    if (n < sizeof(pre) || memcmp(d, pre, sizeof(pre)) != 0) {
+        *len = n;
+        return d;
+    }
+    size_t p = sizeof(pre);
+    while (p + 3 <= n) {
+        uint8_t sec = d[p];
+        if (sec == 'e') {
+            if (p + 5 > n) break;
+            uint32_t l = ((uint32_t)d[p + 1] << 24) | (d[p + 2] << 16) | (d[p + 3] << 8) | d[p + 4];
+            if (p + 5 + l > n) break;
+            *len = l;
+            return d + p + 5;
+        }
+        uint16_t l = (d[p + 1] << 8) | d[p + 2];
+        if (sec >= 'a' && sec <= 'd')
+            PrintAndLogEx(INFO, "  bit header %c: %.*s", sec, (int)(l ? l - 1 : 0), d + p + 3);
+        p += 3 + l;
+    }
+    return NULL;
+}
+
+static int CmdFpgaLoad(const char *Cmd) {
+    CLIParserContext *ctx;
+    CLIParserInit(&ctx, "hw fpgaload",
+                  "Load a Xilinx bitstream (.bit or raw .bin) into the FPGA in slave serial mode,\n"
+                  "streamed from the client, without reflashing the ARM. Config pins can be overridden\n"
+                  "for boards with unknown wiring. Reports whether DONE went high.",
+                  "hw fpgaload -f test_3s50a.bit\n"
+                  "hw fpgaload -f test.bit --cclk 29 --din 30 --prog 28 --done 27"
+                 );
+    void *argtable[] = {
+        arg_param_begin,
+        arg_str1("f", "file", "<fn>", "bitstream file"),
+        arg_int0(NULL, "prog", "<0-31>", "PAx to PROG_B (def 28)"),
+        arg_int0(NULL, "cclk", "<0-31>", "PAx to CCLK (def 29)"),
+        arg_int0(NULL, "din", "<0-31>", "PAx to DIN (def 30)"),
+        arg_int0(NULL, "done", "<0-31>", "PAx from DONE (def 27)"),
+        arg_param_end
+    };
+    CLIExecWithReturn(ctx, Cmd, argtable, false);
+    int fnlen = 0;
+    char fn[FILE_PATH_SIZE] = {0};
+    CLIParamStrToBuf(arg_get_str(ctx, 1), (uint8_t *)fn, FILE_PATH_SIZE, &fnlen);
+    fpga_rawload_req_t req;
+    memset(&req, 0, sizeof(req));
+    req.pin_prog = arg_get_int_def(ctx, 2, 28);
+    req.pin_cclk = arg_get_int_def(ctx, 3, 29);
+    req.pin_din = arg_get_int_def(ctx, 4, 30);
+    req.pin_done = arg_get_int_def(ctx, 5, 27);
+    CLIParserFree(ctx);
+
+    FILE *f = fopen(fn, "rb");
+    if (f == NULL) {
+        PrintAndLogEx(ERR, "can't open %s", fn);
+        return PM3_EFILE;
+    }
+    fseek(f, 0, SEEK_END);
+    long fsz = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (fsz <= 0) {
+        fclose(f);
+        return PM3_EFILE;
+    }
+    uint8_t *buf = calloc(fsz, 1);
+    if (buf == NULL) {
+        fclose(f);
+        return PM3_EMALLOC;
+    }
+    size_t rd = fread(buf, 1, fsz, f);
+    fclose(f);
+
+    size_t len = 0;
+    const uint8_t *data = bit_find_data(buf, rd, &len);
+    if (data == NULL) {
+        PrintAndLogEx(ERR, "no config data section in %s", fn);
+        free(buf);
+        return PM3_EFILE;
+    }
+    PrintAndLogEx(INFO, "%zu bytes of config data, PROG PA%u CCLK PA%u DIN PA%u DONE PA%u",
+                  len, req.pin_prog, req.pin_cclk, req.pin_din, req.pin_done);
+
+    fpga_rawload_resp_t r;
+    req.phase = FPGA_RAWLOAD_START;
+    int res = fpga_rawload_send(&req, sizeof(req), &r, 2000);
+    if (res != PM3_SUCCESS) {
+        free(buf);
+        return res;
+    }
+    PrintAndLogEx(INFO, "PDSR idle %08x  PROG low %08x  released %08x", r.pdsr_idle, r.pdsr_prog, r.pdsr_after);
+
+    req.phase = FPGA_RAWLOAD_DATA;
+    for (size_t off = 0; off < len; off += FPGA_RAWLOAD_CHUNK) {
+        req.len = MIN(FPGA_RAWLOAD_CHUNK, len - off);
+        memcpy(req.data, data + off, req.len);
+        res = fpga_rawload_send(&req, sizeof(req), &r, 2000);
+        if (res != PM3_SUCCESS) {
+            free(buf);
+            return res;
+        }
+    }
+    free(buf);
+
+    req.phase = FPGA_RAWLOAD_FINISH;
+    res = fpga_rawload_send(&req, 8, &r, 5000);
+    if (res != PM3_SUCCESS)
+        return res;
+    PrintAndLogEx(INFO, "%u bytes shifted, PDSR at end %08x", r.bytes, r.pdsr_after);
+    if (r.done_clocks == 0xffffffff)
+        PrintAndLogEx(FAILED, "DONE (PA%u) never went high", req.pin_done);
+    else
+        PrintAndLogEx(SUCCESS, "DONE (PA%u) high after %u extra clocks", req.pin_done, r.done_clocks);
+    return PM3_SUCCESS;
+}
+
+static int CmdFpgaProbe(const char *Cmd) {
+    CLIParserContext *ctx;
+    CLIParserInit(&ctx, "hw fpgaprobe",
+                  "Read raw frames from a wiring-probe bitstream loaded with `hw fpgaload`:\n"
+                  "DIN (PA30) is made an input and clocked by CCLK (PA29). Optionally holds one\n"
+                  "PIOA pin high/low meanwhile, to see which FPGA pin follows it.",
+                  "hw fpgaprobe\n"
+                  "hw fpgaprobe -p 15 -l 1"
+                 );
+    void *argtable[] = {
+        arg_param_begin,
+        arg_int0("p", "pin", "<0-31>", "PAx to hold while reading"),
+        arg_int0("l", "level", "<0|1>", "level to hold (def 0)"),
+        arg_int0(NULL, "bits", "<n>", "bits to read (def 1216)"),
+        arg_int0(NULL, "arm", "<n>", "CCLK edges before reading (def 1100)"),
+        arg_param_end
+    };
+    CLIExecWithReturn(ctx, Cmd, argtable, true);
+    fpga_probe_req_t req;
+    memset(&req, 0, sizeof(req));
+    int pin = arg_get_int_def(ctx, 1, -1);
+    req.pin = pin < 0 ? 0 : pin;
+    req.drive = pin >= 0;
+    req.level = arg_get_int_def(ctx, 2, 0) ? 1 : 0;
+    req.nbits = arg_get_int_def(ctx, 3, 1216);
+    req.arm_clocks = arg_get_int_def(ctx, 4, 1100);
+    CLIParserFree(ctx);
+
+    PacketResponseNG resp;
+    clearCommandBuffer();
+    SendCommandNG(CMD_FPGA_PROBE_READ, (uint8_t *)&req, sizeof(req));
+    if (WaitForResponseTimeout(CMD_FPGA_PROBE_READ, &resp, 3000) == false) {
+        PrintAndLogEx(WARNING, "fpga probe timeout");
+        return PM3_ETIMEOUT;
+    }
+    if (resp.status != PM3_SUCCESS) {
+        PrintAndLogEx(ERR, "fpga probe failed (status %d)", resp.status);
+        return PM3_ESOFT;
+    }
+    PrintAndLogEx(SUCCESS, "probe %s %s", req.drive ? "hold" : "idle",
+                  sprint_hex_inrow(resp.data.asBytes, resp.length));
+    return PM3_SUCCESS;
+}
+
 static int CmdResetCause(const char *Cmd) {
     CLIParserContext *ctx;
     CLIParserInit(&ctx, "hw resetcause",
@@ -1021,6 +1515,12 @@ static command_t CommandTable[] = {
     {"lcd",           CmdLCD,          IfPm3Lcd,        "Send command/data to LCD"},
     {"lcdreset",      CmdLCDReset,     IfPm3Lcd,        "Hardware reset LCD"},
     {"ping",          CmdPing,         IfPm3Present,    "Test if the Proxmark3 is responsive"},
+    {"fpgaload",      CmdFpgaLoad,     IfPm3Present,    "Stream a .bit/.bin into the FPGA (slave serial), report DONE"},
+    {"fpgaprobe",     CmdFpgaProbe,    IfPm3Present,    "Read raw frames from a wiring-probe bitstream"},
+    {"pioadc",        CmdPioAdc,       IfPm3Present,    "Analog read of AD0..AD7, pins with pull-up on/off (supply check)"},
+    {"hfadcdump",     CmdHfAdcDump,    IfPm3Present,    "Dump raw SSC amplitude words from the FPGA HF reader (external ADC check)"},
+    {"rxdump14a",     CmdHf14aRxDump,  IfPm3Present,    "Send WUPA and dump raw FPGA demod stream (14443A RX check)"},
+    {"pioprobe",      CmdPioProbe,     IfPm3Present,    "Drive a PIOA pin and watch which inputs react (board wiring probe)"},
     {"readmem",       CmdReadmem,      IfPm3Present,    "Read memory at decimal address from flash"},
     {"resetcause",    CmdResetCause,   IfPm3Present,    "Show the AT91 reset status register (cause of the last reset)"},
     {"reset",         CmdReset,        IfPm3Present,    "Reset the Proxmark3"},

@@ -457,6 +457,81 @@ typedef struct {
 #define CMD_BREAK_LOOP                                                    0x0118
 #define CMD_SET_TEAROFF                                                   0x0119
 #define CMD_RESET_CAUSE                                                   0x011a
+#define CMD_PIO_PROBE                                                     0x011b
+#define CMD_PIO_ADC                                                       0x011c
+
+// CMD_PIO_PROBE: optionally drive one PIOA pin, then watch every PIOA input for a while
+typedef struct {
+    uint8_t pin;        // PAx to drive
+    uint8_t level;      // 0 / 1 while driven
+    uint8_t drive;      // 0 = only watch, no pin is touched
+    uint8_t pad;
+    uint32_t hold_us;   // how long the pin is driven
+    uint32_t win_us;    // how long to watch after the pin is released
+} PACKED pio_probe_req_t;
+
+typedef struct {
+    uint32_t psr, osr, odsr, pusr;  // PIO config before the probe
+    uint32_t before;                // PDSR before driving
+    uint32_t during;                // PDSR at the end of the hold
+    uint32_t tog_during;            // bits that changed while driven
+    uint32_t after_first;           // PDSR right after release
+    uint32_t after_last;            // PDSR at the end of the window
+    uint32_t tog_after;             // bits that changed (at least once) in the window
+    uint32_t edges_after[32];       // per bit: number of level changes seen in the window
+    uint32_t init_high_us;          // us after release until NINIT (PA4) read 1, 0xffffffff = never
+    uint32_t samples;
+} PACKED pio_probe_resp_t;
+
+// CMD_FPGA_RAWLOAD: slave serial load of a raw bitstream streamed from the client
+#define CMD_FPGA_RAWLOAD                                                  0x011d
+#define FPGA_RAWLOAD_START  0
+#define FPGA_RAWLOAD_DATA   1
+#define FPGA_RAWLOAD_FINISH 2
+#define FPGA_RAWLOAD_CHUNK  480
+
+typedef struct {
+    uint8_t phase;
+    uint8_t pin_prog, pin_cclk, pin_din, pin_done; // PAx, only used by START
+    uint8_t pad;
+    uint16_t len;                                  // DATA: bytes in data[]
+    uint8_t data[FPGA_RAWLOAD_CHUNK];
+} PACKED fpga_rawload_req_t;
+
+typedef struct {
+    uint32_t pdsr_idle;    // START: before the PROG pulse
+    uint32_t pdsr_prog;    // START: while PROG is low
+    uint32_t pdsr_after;   // START: after PROG release / FINISH: at the end
+    uint32_t bytes;        // bytes shifted so far
+    uint32_t done_clocks;  // FINISH: extra CCLKs until DONE went high, 0xffffffff = never
+} PACKED fpga_rawload_resp_t;
+
+// CMD_FPGA_PROBE_READ: clock a wiring-probe bitstream's frames back over CCLK (PA29) / DIN (PA30)
+#define CMD_FPGA_PROBE_READ                                               0x011e
+#define FPGA_PROBE_MAXBYTES 400
+
+typedef struct {
+    uint8_t pin;          // PAx to drive while reading
+    uint8_t level;
+    uint8_t drive;        // 0 = don't drive anything
+    uint8_t pad;
+    uint16_t arm_clocks;  // CCLK edges before reading, the probe only drives DIN after 1024
+    uint16_t nbits;       // bits to read, max FPGA_PROBE_MAXBYTES * 8
+} PACKED fpga_probe_req_t;
+
+// CMD_HF_ADC_DUMP: dump raw SSC amplitude words from the FPGA HF reader path (external ADC check)
+#define CMD_HF_ADC_DUMP                                                   0x011f
+#define HF_ADC_DUMP_WORDS 240
+
+typedef struct {
+    uint8_t mode;     // FPGA_HF_READER_MODE_RECEIVE_* low nibble (0=IQ,1=AMPLITUDE,...)
+    uint8_t pad;
+    uint16_t nwords;  // 16-bit SSC words to grab, max HF_ADC_DUMP_WORDS
+} PACKED hf_adc_dump_req_t;
+
+// CMD_HF_14A_RXDUMP: send a WUPA then dump the raw FPGA demod stream (to see the card reply)
+#define CMD_HF_14A_RXDUMP                                                 0x0120
+#define HF_14A_RXDUMP_BYTES 480
 
 // RDV40, Flash memory operations
 #define CMD_FLASHMEM_WRITE                                                0x0121
