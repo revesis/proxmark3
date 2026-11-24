@@ -19,6 +19,7 @@
 #include "comms.h"
 #include "usart_defs.h"
 #include "ui.h"
+#include "util.h"   // kbd_enter_pressed
 #include "cmdhw.h"
 #include "cmddata.h"
 #include "commonutil.h"
@@ -733,6 +734,185 @@ static int CmdTearoff(const char *Cmd) {
     return handle_tearoff(&params, !silent);
 }
 
+static int CmdCoupling(const char *Cmd) {
+    CLIParserContext *ctx;
+    CLIParserInit(&ctx, "hw coupling",
+                  "Live card <-> antenna coupling meter (HF / ISO14443-A).\n"
+                  "Repeatedly tries to read a card and shows the success rate over the last\n"
+                  "8 tries: the 4 on-board LEDs (A..D) fill up the better the coupling is, and\n"
+                  "the console shows a live bar + the UID. Move the card to find the best spot.\n"
+                  "(This board's analog field-voltage sensing saturates and is unusable, so\n"
+                  "coupling is measured by how reliably the card actually answers.)\n"
+                  "Press <Enter> or the pm3 button to stop.",
+                  "hw coupling\n"
+                  "hw coupling --ms 40\n"
+                  "hw coupling --t1 2 --t2 4 --t3 6 --t4 8"
+                 );
+    void *argtable[] = {
+        arg_param_begin,
+        arg_u64_0(NULL, "ms", "<dec>", "interval between tries, ms (def 60)"),
+        arg_u64_0(NULL, "t1", "<dec>", "reads-out-of-8 to leave BLUE/no-card (def 1)"),
+        arg_u64_0(NULL, "t2", "<dec>", "reads-out-of-8 for ORANGE (def 4)"),
+        arg_u64_0(NULL, "t3", "<dec>", "reads-out-of-8 for GREEN (def 7)"),
+        arg_u64_0(NULL, "t4", "<dec>", "(unused in traffic-light mode)"),
+        arg_param_end
+    };
+    CLIExecWithReturn(ctx, Cmd, argtable, true);
+    uint32_t ms = arg_get_u32_def(ctx, 1, 60);
+    uint32_t t1 = arg_get_u32_def(ctx, 2, 3);
+    uint32_t t2 = arg_get_u32_def(ctx, 3, 5);
+    uint32_t t3 = arg_get_u32_def(ctx, 4, 7);
+    uint32_t t4 = arg_get_u32_def(ctx, 5, 7);
+    CLIParserFree(ctx);
+
+    if (ms > 2000) ms = 2000;
+    if (ms < 10) ms = 10;
+
+    struct {
+        uint8_t  field;
+        uint16_t sample_ms;
+        uint8_t  t1, t2, t3, t4;
+    } PACKED req;
+    req.field = 0;
+    req.sample_ms = (uint16_t)ms;
+    req.t1 = (uint8_t)t1; req.t2 = (uint8_t)t2; req.t3 = (uint8_t)t3; req.t4 = (uint8_t)t4;
+
+    PrintAndLogEx(INFO, "HF coupling meter (ISO14443-A). Put a card on the antenna and move it.");
+    PrintAndLogEx(INFO, "More LEDs / higher read rate = better coupling. Press " _GREEN_("<Enter>") " to stop.");
+    PrintAndLogEx(NORMAL, "");
+
+    clearCommandBuffer();
+    SendCommandNG(CMD_COUPLING_METER, (uint8_t *)&req, sizeof(req));
+
+    for (;;) {
+        if (kbd_enter_pressed()) {
+            SendCommandNG(CMD_BREAK_LOOP, NULL, 0);
+            break;
+        }
+        PacketResponseNG resp;
+        if (WaitForResponseTimeout(CMD_COUPLING_METER, &resp, 1500)) {
+            if (resp.status == PM3_EOPABORTED)
+                break;
+            if (resp.status == PM3_SUCCESS && resp.length >= 8) {
+                struct rr {
+                    uint8_t  ok_count;
+                    uint8_t  window;
+                    uint8_t  last_ok;
+                    uint8_t  bars;
+                    uint32_t uid;
+                } PACKED;
+                struct rr *r = (struct rr *)resp.data.asBytes;
+                // coupling: traffic-light. tier in r->bars: 0 blue/none,1 red,2 orange,3 green.
+                // board colours A=orange B=blue C=red D=green.
+                const char *lamp;
+                switch (r->bars) {
+                    case 3:  lamp = _GREEN_("GREEN  good    "); break;
+                    case 2:  lamp = _YELLOW_("ORANGE marginal"); break;
+                    case 1:  lamp = _RED_("RED    poor    "); break;
+                    default: lamp = _CYAN_("BLUE   no card "); break;
+                }
+                if (r->uid)
+                    PrintAndLogEx(NORMAL, "\r  [ %s ]  reads " _YELLOW_("%u/%u") "   last UID: " _CYAN_("%08X") "    " NOLF,
+                                  lamp, r->ok_count, r->window, r->uid);
+                else
+                    PrintAndLogEx(NORMAL, "\r  [ %s ]  reads " _YELLOW_("%u/%u") "                        " NOLF,
+                                  lamp, r->ok_count, r->window);
+                fflush(stdout);
+            }
+        }
+    }
+    PrintAndLogEx(NORMAL, "");
+    PrintAndLogEx(INFO, "Coupling meter stopped.");
+    return PM3_SUCCESS;
+}
+
+static int CmdLedTest(const char *Cmd) {
+    CLIParserContext *ctx;
+    CLIParserInit(&ctx, "hw ledtest",
+                  "Blink the 4 on-board LEDs (A/B/C/D) to verify each bead, OR directly set\n"
+                  "individual LEDs with --a/--b/--c/--d (0=off, 1=on; a LED you don't list is\n"
+                  "left unchanged). --on / --off set all four at once.",
+                  "hw ledtest                 -> blink self-test (A,B,C,D then all together)\n"
+                  "hw ledtest --rounds 5 --delay 200\n"
+                  "hw ledtest --a 1           -> LED A on, leave the rest\n"
+                  "hw ledtest --a 0 --c 1     -> A off, C on, B/D unchanged\n"
+                  "hw ledtest --on            -> all four on\n"
+                  "hw ledtest --off           -> all four off"
+                 );
+    void *argtable[] = {
+        arg_param_begin,
+        arg_u64_0("r", "rounds", "<dec>", "blink: repeat count per phase (def 3)"),
+        arg_u64_0(NULL, "delay", "<dec>", "blink: per-step delay in ms (def 120)"),
+        arg_int0(NULL, "a", "<0|1>", "set LED A (0=off, 1=on)"),
+        arg_int0(NULL, "b", "<0|1>", "set LED B (0=off, 1=on)"),
+        arg_int0(NULL, "c", "<0|1>", "set LED C (0=off, 1=on)"),
+        arg_int0(NULL, "d", "<0|1>", "set LED D (0=off, 1=on)"),
+        arg_lit0(NULL, "on",  "turn all four LEDs on"),
+        arg_lit0(NULL, "off", "turn all four LEDs off"),
+        arg_param_end
+    };
+    CLIExecWithReturn(ctx, Cmd, argtable, true);
+    uint32_t rounds = arg_get_u32_def(ctx, 1, 3);
+    uint32_t delay  = arg_get_u32_def(ctx, 2, 120);
+    int la = arg_get_int_def(ctx, 3, -1);
+    int lb = arg_get_int_def(ctx, 4, -1);
+    int lc = arg_get_int_def(ctx, 5, -1);
+    int ld = arg_get_int_def(ctx, 6, -1);
+    bool all_on  = arg_get_lit(ctx, 7);
+    bool all_off = arg_get_lit(ctx, 8);
+    CLIParserFree(ctx);
+
+    bool set_mode = (la >= 0 || lb >= 0 || lc >= 0 || ld >= 0 || all_on || all_off);
+
+    if (set_mode) {
+        uint8_t state = 0, care = 0;
+        if (all_on)  { state = 0x0F; care = 0x0F; }
+        if (all_off) { state = 0x00; care = 0x0F; }
+        if (la == 0) { care |= 0x01; state &= ~0x01; } else if (la == 1) { care |= 0x01; state |= 0x01; }
+        if (lb == 0) { care |= 0x02; state &= ~0x02; } else if (lb == 1) { care |= 0x02; state |= 0x02; }
+        if (lc == 0) { care |= 0x04; state &= ~0x04; } else if (lc == 1) { care |= 0x04; state |= 0x04; }
+        if (ld == 0) { care |= 0x08; state &= ~0x08; } else if (ld == 1) { care |= 0x08; state |= 0x08; }
+
+        uint8_t data[3] = { 1, state, care };
+        clearCommandBuffer();
+        SendCommandNG(CMD_LED_TEST, data, sizeof(data));
+        PacketResponseNG resp;
+        if (WaitForResponseTimeout(CMD_LED_TEST, &resp, 2000) == false) {
+            PrintAndLogEx(WARNING, "LED set timeout.");
+            return PM3_ETIMEOUT;
+        }
+        PrintAndLogEx(SUCCESS, "LEDs set:  A=%s  B=%s  C=%s  D=%s",
+                      (care & 0x01) ? ((state & 0x01) ? _GREEN_("on") : _RED_("off")) : "--",
+                      (care & 0x02) ? ((state & 0x02) ? _GREEN_("on") : _RED_("off")) : "--",
+                      (care & 0x04) ? ((state & 0x04) ? _GREEN_("on") : _RED_("off")) : "--",
+                      (care & 0x08) ? ((state & 0x08) ? _GREEN_("on") : _RED_("off")) : "--");
+        return PM3_SUCCESS;
+    }
+
+    if (rounds == 0) rounds = 1;
+    if (rounds > 255) rounds = 255;
+    if (delay > 2000) delay = 2000;
+
+    uint8_t data[4];
+    data[0] = 0;                       // mode 0 = blink
+    data[1] = (uint8_t)rounds;
+    data[2] = (uint8_t)(delay & 0xff);
+    data[3] = (uint8_t)((delay >> 8) & 0xff);
+
+    PrintAndLogEx(INFO, "Running LED test (" _YELLOW_("%u") " rounds, " _YELLOW_("%u") " ms/step)...", rounds, delay);
+    PrintAndLogEx(INFO, "Watch: A -> B -> C -> D one at a time, then all four blink.");
+    clearCommandBuffer();
+    SendCommandNG(CMD_LED_TEST, data, sizeof(data));
+    PacketResponseNG resp;
+    uint32_t tmo = (rounds * 6 * delay) + 2000;
+    if (WaitForResponseTimeout(CMD_LED_TEST, &resp, tmo) == false) {
+        PrintAndLogEx(WARNING, "LED test timeout. You probably need to unplug the Proxmark3.");
+        return PM3_ETIMEOUT;
+    }
+    PrintAndLogEx(SUCCESS, "LED test done.");
+    return PM3_SUCCESS;
+}
+
 static int CmdTia(const char *Cmd) {
     CLIParserContext *ctx;
     CLIParserInit(&ctx, "hw tia",
@@ -1041,6 +1221,31 @@ static int CmdPioProbe(const char *Cmd) {
         PrintAndLogEx(SUCCESS, "  NINIT never high in window");
     else
         PrintAndLogEx(SUCCESS, "  NINIT high after %u us", r.init_high_us);
+    return PM3_SUCCESS;
+}
+
+static int CmdLfGpioSweep(const char *Cmd) {
+    (void) Cmd;
+    clearCommandBuffer();
+    SendCommandNG(CMD_LF_GPIO_SWEEP, NULL, 0);
+    PacketResponseNG resp;
+    if (WaitForResponseTimeout(CMD_LF_GPIO_SWEEP, &resp, 20000) == false) {
+        PrintAndLogEx(WARNING, "lfgpiosweep timeout");
+        return PM3_ETIMEOUT;
+    }
+    lf_gpio_sweep_resp_t r;
+    memcpy(&r, resp.data.asBytes, sizeof(r));
+    uint16_t best = 0; int bi = 0;
+    for (int i = 0; i < r.n; i++) if (r.pt[i].lopkd > best) { best = r.pt[i].lopkd; bi = i; }
+    PrintAndLogEx(INFO, "LF antenna freq sweep (LOPKD = field strength):");
+    PrintAndLogEx(INFO, " div   freq(kHz)  LOPKD  HIPKD");
+    for (int i = 0; i < r.n; i++) {
+        uint32_t f = 24000 / (2 * (r.pt[i].div + 1));
+        PrintAndLogEx(SUCCESS, " %3u    %4u     %5u  %5u %s",
+                      r.pt[i].div, f, r.pt[i].lopkd, r.pt[i].hipkd, (i == bi) ? "<== PEAK" : "");
+    }
+    uint32_t pf = 24000 / (2 * (r.pt[bi].div + 1));
+    PrintAndLogEx(INFO, "resonance peak: LOPKD=%u at div=%u (~%u kHz)", best, r.pt[bi].div, pf);
     return PM3_SUCCESS;
 }
 
@@ -1521,6 +1726,9 @@ static command_t CommandTable[] = {
     {"hfadcdump",     CmdHfAdcDump,    IfPm3Present,    "Dump raw SSC amplitude words from the FPGA HF reader (external ADC check)"},
     {"rxdump14a",     CmdHf14aRxDump,  IfPm3Present,    "Send WUPA and dump raw FPGA demod stream (14443A RX check)"},
     {"pioprobe",      CmdPioProbe,     IfPm3Present,    "Drive a PIOA pin and watch which inputs react (board wiring probe)"},
+    {"lfgpiosweep",   CmdLfGpioSweep,  IfPm3Present,    "Sweep ARM PIOs, measure LF LOPKD/SSC (LF RX mux probe)"},
+    {"ledtest",       CmdLedTest,      IfPm3Present,    "Blink the 4 on-board LEDs (A/B/C/D) to verify each bead"},
+    {"coupling",      CmdCoupling,     IfPm3Present,    "Live card<->antenna coupling strength meter (ABCD bar)"},
     {"readmem",       CmdReadmem,      IfPm3Present,    "Read memory at decimal address from flash"},
     {"resetcause",    CmdResetCause,   IfPm3Present,    "Show the AT91 reset status register (cause of the last reset)"},
     {"reset",         CmdReset,        IfPm3Present,    "Reset the Proxmark3"},

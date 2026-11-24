@@ -459,6 +459,15 @@ typedef struct {
 #define CMD_RESET_CAUSE                                                   0x011a
 #define CMD_PIO_PROBE                                                     0x011b
 #define CMD_PIO_ADC                                                       0x011c
+#define CMD_LF_GPIO_SWEEP                                                 0x013B
+#define CMD_LED_TEST                                                     0x013C
+#define CMD_COUPLING_METER                                               0x013D
+
+typedef struct {
+    uint8_t n;
+    struct { uint8_t div; uint16_t lopkd; uint16_t hipkd; } PACKED pt[48];
+} PACKED lf_gpio_sweep_resp_t;
+
 
 // CMD_PIO_PROBE: optionally drive one PIOA pin, then watch every PIOA input for a while
 typedef struct {

@@ -2360,6 +2360,40 @@ int ReaderReceive(uint8_t *receivedAnswer, uint8_t *par) {
     return Demod.len;
 }
 
+// Same as GetIso14443aAnswerFromTag()+ReaderReceive(), but deliberately does NOT call
+// LED_D_ON(). The green bead (LED_D) is the stock "HF field on" indicator and the normal
+// receive path re-lights it on every frame, which makes it flicker. The hw coupling meter
+// wants to own all 4 LEDs (traffic-light), so it receives through this LED-free variant and
+// drives LED_D itself. Returns Demod.len (0 = no answer).
+int ReaderReceiveNoFieldLED(uint8_t *receivedAnswer, uint8_t *par) {
+    if (g_hf_field_active == false)
+        return 0;
+    // NOTE: no LED_D_ON() here, unlike GetIso14443aAnswerFromTag()
+    FpgaWriteConfWord(FPGA_MAJOR_MODE_HF_ISO14443A | FPGA_HF_ISO14443A_READER_LISTEN);
+    Demod14aInit(receivedAnswer, par);
+    uint8_t b = (uint8_t)AT91C_BASE_SSC->SSC_RHR;
+    (void)b;
+    volatile uint32_t c = 0;
+    uint32_t timeout = iso14a_get_timeout();
+    uint32_t receive_timer = GetTickCount();
+    for (;;) {
+        WDT_HIT();
+        if (AT91C_BASE_SSC->SSC_SR & (AT91C_SSC_RXRDY)) {
+            b = (uint8_t)AT91C_BASE_SSC->SSC_RHR;
+            if (ManchesterDecoding(b, 0, 0)) {
+                NextTransferTime = MAX(NextTransferTime, Demod.endTime - (DELAY_AIR2ARM_AS_READER + DELAY_ARM2AIR_AS_READER) / 16 + FRAME_DELAY_TIME_PICC_TO_PCD);
+                LogTrace(receivedAnswer, Demod.len, Demod.startTime * 16 - DELAY_AIR2ARM_AS_READER, Demod.endTime * 16 - DELAY_AIR2ARM_AS_READER, par, false);
+                return Demod.len;
+            } else if (c++ > timeout && Demod.state == DEMOD_14A_UNSYNCD) {
+                return 0;
+            }
+        }
+        if (GetTickCountDelta(receive_timer) > timeout + 100)
+            break;
+    }
+    return 0;
+}
+
 
 // This function misstreats the ISO 14443a anticollision procedure.
 // by fooling the reader there is a collision and forceing the reader to

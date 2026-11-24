@@ -452,6 +452,24 @@ static void PioProbe(const pio_probe_req_t *req) {
 // Analog look at the pins: AD0..AD3 share PA17..PA20 (PA17/PA18 go straight to FPGA I/O).
 // Each of those is read as a plain input with the internal pull-up on and off; a pin held near
 // a diode drop with the pull-up on is being clamped into an unpowered rail. AD4..AD7 as they are.
+static void LfGpioSweep(void) {
+    lf_gpio_sweep_resp_t r;
+    memset(&r, 0, sizeof(r));
+    int idx = 0;
+    for (int d = 40; d <= 240 && idx < 48; d += 5) {
+        LFSetupFPGAForADC(d, true);
+        SetAdcMuxFor(GPIO_MUXSEL_LOPKD);
+        WaitMS(12);
+        r.pt[idx].div = (uint8_t)d;
+        r.pt[idx].lopkd = AvgAdc(3);
+        r.pt[idx].hipkd = AvgAdc(2);
+        idx++;
+        WDT_HIT();
+    }
+    r.n = (uint8_t)idx;
+    reply_ng(CMD_LF_GPIO_SWEEP, PM3_SUCCESS, (uint8_t *)&r, sizeof(r));
+}
+
 static void PioAdc(void) {
     uint16_t v[3][8];
     memset(v, 0, sizeof(v));
@@ -2667,6 +2685,10 @@ static void PacketReceived(PacketCommandNG *packet) {
             PioAdc();
             break;
         }
+        case CMD_LF_GPIO_SWEEP: {
+            LfGpioSweep();
+            break;
+        }
         case CMD_FPGA_RAWLOAD: {
             FpgaRawLoad((const fpga_rawload_req_t *)packet->data.asBytes);
             break;
@@ -2709,6 +2731,128 @@ static void PacketReceived(PacketCommandNG *packet) {
         }
         case CMD_PING: {
             reply_ng(CMD_PING, PM3_SUCCESS, packet->data.asBytes, packet->length);
+            break;
+        }
+        case CMD_LED_TEST: {
+            // payload: [0]=mode (0=blink self-test, 1=set individual LEDs)
+            //   blink: [1]=rounds u8, [2..3]=per-step delay ms u16 LE
+            //   set:   [1]=state mask (bit0=A,1=B,2=C,3=D; 1=on), [2]=care mask (which to apply)
+            uint8_t mode = (packet->length >= 1) ? packet->data.asBytes[0] : 0;
+
+            if (mode == 1) {
+                uint8_t state = (packet->length >= 2) ? packet->data.asBytes[1] : 0;
+                uint8_t care  = (packet->length >= 3) ? packet->data.asBytes[2] : 0x0F;
+                if (care & 0x01) { if (state & 0x01) LED_A_ON(); else LED_A_OFF(); }
+                if (care & 0x02) { if (state & 0x02) LED_B_ON(); else LED_B_OFF(); }
+                if (care & 0x04) { if (state & 0x04) LED_C_ON(); else LED_C_OFF(); }
+                if (care & 0x08) { if (state & 0x08) LED_D_ON(); else LED_D_OFF(); }
+                reply_ng(CMD_LED_TEST, PM3_SUCCESS, NULL, 0);
+                break;
+            }
+
+            // mode 0: blink self-test
+            uint8_t rounds = (packet->length >= 2 && packet->data.asBytes[1]) ? packet->data.asBytes[1] : 3;
+            uint16_t d = 120;
+            if (packet->length >= 4) {
+                uint16_t v = packet->data.asBytes[2] | (packet->data.asBytes[3] << 8);
+                if (v) d = v;
+            }
+            LEDsoff();
+            // Phase 1: light each bead alone so A/B/C/D can be verified one at a time
+            for (uint8_t r = 0; r < rounds; r++) {
+                LED_A_ON(); SpinDelay(d); LED_A_OFF();
+                LED_B_ON(); SpinDelay(d); LED_B_OFF();
+                LED_C_ON(); SpinDelay(d); LED_C_OFF();
+                LED_D_ON(); SpinDelay(d); LED_D_OFF();
+            }
+            // Phase 2: all four blink together
+            for (uint8_t r = 0; r < rounds; r++) {
+                LED_A_ON(); LED_B_ON(); LED_C_ON(); LED_D_ON();
+                SpinDelay(d);
+                LEDsoff();
+                SpinDelay(d);
+            }
+            LEDsoff();
+            reply_ng(CMD_LED_TEST, PM3_SUCCESS, NULL, 0);
+            break;
+        }
+        case CMD_COUPLING_METER: {
+            // Comms-based HF coupling meter, WUPA presence (no select/anticollision, so no
+            // UID but far lighter & faster). Receives through ReaderReceiveNoFieldLED so the
+            // stock green "field" LED does NOT flicker -- this loop owns all 4 beads as a
+            // traffic-light: blue(B)=no card, red(C)=weak, orange(A)=marginal, green(D)=good.
+            // req: [0]=field(unused), [1..2]=sample_ms u16 LE, [3..6]=count thresholds
+            //      t1=red-min, t2=orange-min, t3=green-min (out of 8), t4 unused.
+            struct req_t {
+                uint8_t  field;
+                uint16_t sample_ms;
+                uint8_t  t1, t2, t3, t4;
+            } PACKED;
+            struct req_t req = {0, 0, 0, 0, 0, 0};
+            if (packet->length >= sizeof(struct req_t))
+                memcpy(&req, packet->data.asBytes, sizeof(struct req_t));
+
+            uint16_t sample_ms = req.sample_ms ? req.sample_ms : 60;
+            uint8_t t_red    = req.t1 ? req.t1 : 3;   // >=this out of 8 -> red (reject 1-2/8 noise)
+            uint8_t t_orange = req.t2 ? req.t2 : 5;
+            uint8_t t_green  = req.t3 ? req.t3 : 7;
+
+            iso14443a_setup(FPGA_HF_ISO14443A_READER_LISTEN);
+            LEDsoff();                 // take the green field-LED under our control
+
+            struct resp_t {
+                uint8_t  ok_count;     // ATQA hits in the last 8 tries
+                uint8_t  window;       // = 8
+                uint8_t  last_ok;      // 1 if the most recent WUPA got an ATQA
+                uint8_t  bars;         // tier 0..3 (blue/red/orange/green)
+                uint32_t uid;          // ATQA (2 bytes) of last hit, 0 if none
+            } PACKED;
+
+            uint8_t wupa = 0x52;   // ISO14443A WUPA
+            uint8_t hist = 0;
+            uint32_t last_atqa = 0;
+            int prev_tier = -1;
+            while (!BUTTON_PRESS() && !data_available()) {
+                WDT_HIT();
+                uint8_t resp[8] = {0};
+                uint8_t resppar[1] = {0};
+                iso14a_set_timeout(1236 / 128 + 1);
+                ReaderTransmitBitsPar(&wupa, 7, NULL, NULL);
+                int len = ReaderReceiveNoFieldLED(resp, resppar);
+                int ok = (len >= 2);   // 2-byte ATQA = a card answered
+                hist = (hist << 1) | (ok ? 1 : 0);
+                uint8_t cnt = 0;
+                for (uint8_t b = 0; b < 8; b++)
+                    if (hist & (1 << b)) cnt++;
+                if (ok)
+                    last_atqa = ((uint32_t)resp[0] << 8) | resp[1];
+
+                uint8_t tier;
+                if (cnt < t_red)         tier = 0;   // blue  : no card
+                else if (cnt < t_orange) tier = 1;   // red   : weak
+                else if (cnt < t_green)  tier = 2;   // orange: marginal
+                else                     tier = 3;   // green : good
+                if (tier != prev_tier) {             // only touch LEDs on change -> rock steady
+                    LEDsoff();
+                    if      (tier == 0) LED_B_ON();
+                    else if (tier == 1) LED_C_ON();
+                    else if (tier == 2) LED_A_ON();
+                    else                LED_D_ON();
+                    prev_tier = tier;
+                }
+
+                struct resp_t r;
+                r.ok_count = cnt;
+                r.window = 8;
+                r.last_ok = ok ? 1 : 0;
+                r.bars = tier;
+                r.uid = last_atqa;
+                reply_ng(CMD_COUPLING_METER, PM3_SUCCESS, (uint8_t *)&r, sizeof(r));
+                SpinDelay(sample_ms);
+            }
+            switch_off();
+            LEDsoff();
+            reply_ng(CMD_COUPLING_METER, PM3_EOPABORTED, NULL, 0);
             break;
         }
 #ifdef WITH_LCD

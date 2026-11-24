@@ -2612,11 +2612,75 @@ int CmdHF14ANdefRead(const char *Cmd) {
     return PM3_SUCCESS;
 }
 
+// Read a tag UID and print it as a decimal "card number": the UID bytes
+// interpreted as a little-endian integer (uid[0] = least significant byte).
+static int CmdHF14ACardval(const char *Cmd) {
+    CLIParserContext *ctx;
+    CLIParserInit(&ctx, "hf 14a cardval",
+                  "Read an ISO14443-a tag UID and convert it to a decimal card number.\n"
+                  "The UID bytes are interpreted as a little-endian integer\n"
+                  "(uid[0] = least significant byte), e.g. UID 5E 27 C7 B8 -> 3100059486.",
+                  "hf 14a cardval\n"
+                  "hf 14a cardval -s   -> print only the decimal card number\n"
+                 );
+
+    void *argtable[] = {
+        arg_param_begin,
+        arg_lit0("s", "silent", "print only the decimal card number"),
+        arg_param_end
+    };
+    CLIExecWithReturn(ctx, Cmd, argtable, true);
+    bool silent = arg_get_lit(ctx, 1);
+    CLIParserFree(ctx);
+
+    clearCommandBuffer();
+    SendCommandMIX(CMD_HF_ISO14443A_READER, ISO14A_CONNECT, 0, 0, NULL, 0);
+
+    PacketResponseNG resp;
+    if (!WaitForResponseTimeout(CMD_ACK, &resp, 2500)) {
+        if (!silent) PrintAndLogEx(WARNING, "iso14443a card select failed");
+        DropField();
+        return PM3_ESOFT;
+    }
+
+    iso14a_card_select_t card;
+    memcpy(&card, (iso14a_card_select_t *)resp.data.asBytes, sizeof(iso14a_card_select_t));
+
+    uint64_t select_status = resp.oldarg[0];
+    if (select_status == 0 || select_status == 3 || card.uidlen == 0) {
+        if (!silent) PrintAndLogEx(WARNING, "iso14443a card select failed");
+        DropField();
+        return PM3_ESOFT;
+    }
+
+    uint8_t n = card.uidlen;
+    if (n > 8) {
+        if (!silent) PrintAndLogEx(WARNING, "UID is %u bytes; value computed from first 8 bytes only", card.uidlen);
+        n = 8;
+    }
+
+    uint64_t cardval = 0;
+    for (uint8_t i = 0; i < n; i++) {
+        cardval |= ((uint64_t)card.uid[i]) << (8 * i);
+    }
+
+    if (silent) {
+        PrintAndLogEx(NORMAL, "%" PRIu64, cardval);
+    } else {
+        PrintAndLogEx(SUCCESS, " UID: " _GREEN_("%s"), sprint_hex(card.uid, card.uidlen));
+        PrintAndLogEx(SUCCESS, "Card: " _GREEN_("%" PRIu64), cardval);
+    }
+
+    DropField();
+    return PM3_SUCCESS;
+}
+
 static command_t CommandTable[] = {
     {"help",        CmdHelp,              AlwaysAvailable, "This help"},
     {"list",        CmdHF14AList,         AlwaysAvailable, "List ISO 14443-a history"},
     {"info",        CmdHF14AInfo,         IfPm3Iso14443a,  "Tag information"},
     {"reader",      CmdHF14AReader,       IfPm3Iso14443a,  "Act like an ISO14443-a reader"},
+    {"cardval",     CmdHF14ACardval,      IfPm3Iso14443a,  "Read UID and show it as a little-endian decimal card number"},
     {"ndefread",    CmdHF14ANdefRead,     IfPm3Iso14443a,  "Read an NDEF file from ISO 14443-A Type 4 tag"},
     {"cuids",       CmdHF14ACUIDs,        IfPm3Iso14443a,  "Collect n>0 ISO14443-a UIDs in one go"},
     {"sim",         CmdHF14ASim,          IfPm3Iso14443a,  "Simulate ISO 14443-a tag"},
